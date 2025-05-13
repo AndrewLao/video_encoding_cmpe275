@@ -23,6 +23,10 @@ service VideoProcessingService {
   rpc GetShard (GetShardRequest) returns (GetShardResponse);
   // RPC for master to check health of worker nodes
   rpc CheckHealth (HealthCheckRequest) returns (HealthCheckResponse);
+  // RPC for listing shards stored on a worker
+  rpc ListShards (ListShardsRequest) returns (ListShardsResponse);
+  // RPC for getting metadata for all chunks of a video
+  rpc GetVideoMetadata (GetVideoMetadataRequest) returns (GetVideoMetadataResponse);
 }
 
 // --- Client Requests/Responses (Existing) ---
@@ -138,4 +142,50 @@ message HealthCheckResponse {
   int64 memory_usage_bytes = 4; // Current memory usage in bytes
   int32 active_tasks = 5; // Number of tasks currently being processed
   string message = 6; // Additional health information or error message
+}
+
+// --- Shard Listing Messages (New) ---
+
+message ListShardsRequest {
+  string video_id = 1; // Optional: If specified, list only shards for this video; if empty, list all videos
+}
+
+message ChunkInfo {
+  int32 chunk_index = 1; // Index of the chunk in the original video
+  string shard_location = 2; // Location where the shard is stored
+  int64 size_bytes = 3; // Size of the shard in bytes
+}
+
+message VideoInfo {
+  string video_id = 1; // Identifier for the video
+  repeated ChunkInfo chunks = 2; // Information about each chunk/shard
+}
+
+message ListShardsResponse {
+  bool success = 1; // Whether the operation was successful
+  string worker_id = 2; // Identifier of the worker responding
+  string message = 3; // Status or error message
+  repeated VideoInfo videos = 4; // Information about videos and their shards
+}
+
+// --- Video Metadata Messages (New) ---
+
+message GetVideoMetadataRequest {
+  string video_id = 1; // Identifier for the video to get metadata for
+}
+
+message ChunkMetadata {
+  int32 chunk_index = 1; // Index of the chunk in the original video
+  int64 original_size = 2; // Original size of the chunk in bytes
+  int64 encoded_size = 3; // Size after encoding in bytes
+  float compression_ratio = 4; // Ratio of encoded size to original size
+  string shard_location = 5; // Location where the shard is stored
+  string timestamp = 6; // When the chunk was processed
+}
+
+message GetVideoMetadataResponse {
+  bool success = 1; // Whether the operation was successful
+  string worker_id = 2; // Identifier of the worker responding
+  string message = 3; // Status or error message
+  repeated ChunkMetadata chunks_metadata = 4; // Metadata for each chunk
 }

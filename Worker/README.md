@@ -4,6 +4,8 @@
 
 - `test_worker_client.py`: A client script to test the video processing worker. It can read a video file, chunk it, send chunks to a worker, and retrieve the processed shards.
 
+- `test_shard_storage.py`: A utility to test and demonstrate the shard storage functionality, including listing stored shards and retrieving metadata.
+
 - `video_processing.proto`: Defines the gRPC service (`VideoProcessingService`) and the message structures used for communication between the Master (test client) and the Worker.
 
 - `setup_env.sh`: A convenience script to set up a Python virtual environment, install dependencies, and compile _only_ the `video_processing.proto` file.
@@ -94,6 +96,70 @@ The test client simulates a Master sending video chunks to a worker and retrievi
 The system includes a health check mechanism that allows the master to monitor the health and status of worker nodes.
 
 Refer healthCheck.md 
+
+## Shard Storage System
+
+The Worker implements an enhanced shard storage system that organizes video shards in a structured directory hierarchy and maintains metadata about each processed chunk.
+
+### Directory Structure
+
+- `video_shards/`: Root directory for all shards
+  - `<video_id>/`: Subdirectory for each video (created automatically)
+    - `chunk_<index>.shard`: Individual shard files for each processed chunk
+  - `metadata/`: Directory containing metadata for all processed shards
+    - `<video_id>_chunk_<index>_metadata.json`: Metadata files for each shard
+
+### Metadata Storage
+
+For each processed chunk, the worker stores metadata in a JSON file that includes:
+- Video ID
+- Chunk index
+- Original size (before encoding)
+- Encoded size (after encoding)
+- Compression ratio
+- Worker ID that processed the chunk
+- Shard location (absolute path)
+- Timestamp when processed
+
+### API for Shard Management
+
+The worker provides additional gRPC methods for managing and retrieving shards:
+
+1. **ListShards**: Lists all shards for a specific video or all videos on the worker
+   ```
+   python test_shard_storage.py localhost:50061 [video_id]
+   ```
+
+2. **GetVideoMetadata**: Retrieves metadata for all chunks of a specific video
+   ```
+   python test_shard_storage.py localhost:50061 video_id
+   ```
+
+3. **GetShard**: Retrieves the content of a specific shard
+   ```
+   python test_shard_storage.py localhost:50061 video_id /path/to/shard
+   ```
+
+### Testing Shard Storage
+
+The `test_shard_storage.py` script allows you to test and demonstrate the shard storage functionality:
+
+```bash
+# Make the script executable if needed
+chmod +x ./test_shard_storage.py
+
+# List all shards on the worker
+./test_shard_storage.py localhost:50061
+
+# List shards for a specific video
+./test_shard_storage.py localhost:50061 my_video.mp4
+
+# Get metadata for a specific video
+./test_shard_storage.py localhost:50061 my_video.mp4
+
+# Retrieve a specific shard (if you know the path)
+./test_shard_storage.py localhost:50061 my_video.mp4 /absolute/path/to/shard
+```
 
 ## Further Development
 

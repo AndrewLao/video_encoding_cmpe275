@@ -9,15 +9,20 @@ import os
 import time
 import random
 import psutil
+import json
 from concurrent import futures
+from datetime import datetime
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Directory to store processed shards
+# Directory structure for storing processed shards
 SHARDS_DIR = "video_shards"
-# Ensure the shards directory exists when the worker starts
+METADATA_DIR = os.path.join(SHARDS_DIR, "metadata")
+
+# Ensure the shards directory structure exists when the worker starts
 os.makedirs(SHARDS_DIR, exist_ok=True)
-logging.info(f"Ensured shards directory exists at: {os.path.abspath(SHARDS_DIR)}")
+os.makedirs(METADATA_DIR, exist_ok=True)
+logging.info(f"Ensured shards directory structure exists at: {os.path.abspath(SHARDS_DIR)}")
 
 class VideoProcessingWorker(replication_pb2_grpc.VideoProcessingServiceServicer):
     """Implements the VideoProcessingService for workers."""
@@ -30,6 +35,7 @@ class VideoProcessingWorker(replication_pb2_grpc.VideoProcessingServiceServicer)
         self._file_read_lock = asyncio.Lock() # Lock for reading shards (less critical but good practice)
         self._active_tasks = 0  # Counter for active processing tasks
         self._active_tasks_lock = asyncio.Lock()  # Lock for the active tasks counter
+        self._metadata_lock = asyncio.Lock()  # Lock for metadata operations
 
 
     async def ProcessChunk(self, request: replication_pb2.ProcessChunkRequest, context: grpc.aio.ServicerContext) -> replication_pb2.ProcessChunkResponse:
@@ -56,9 +62,13 @@ class VideoProcessingWorker(replication_pb2_grpc.VideoProcessingServiceServicer)
 
                 logging.info(f"[{self.worker_id}] Simulated encoding for chunk {chunk_index} (Encoded size: {encoded_size} bytes, Took {simulated_encoding_time:.2f}s)")
 
-                # --- Simulate Sharding and Storage ---
-                shard_filename = f"{video_id}_chunk_{chunk_index}.shard"
-                shard_path = os.path.join(SHARDS_DIR, shard_filename)
+                # --- Create video-specific directory for shards ---
+                video_dir = os.path.join(SHARDS_DIR, video_id)
+                os.makedirs(video_dir, exist_ok=True)
+
+                # --- Store the shard file ---
+                shard_filename = f"chunk_{chunk_index}.shard"
+                shard_path = os.path.join(video_dir, shard_filename)
 
                 async with self._file_write_lock:
                      try:
@@ -66,6 +76,9 @@ class VideoProcessingWorker(replication_pb2_grpc.VideoProcessingServiceServicer)
                              f.write(encoded_data)
                          logging.info(f"[{self.worker_id}] Stored shard for chunk {chunk_index} at '{shard_path}'")
                          shard_location = os.path.abspath(shard_path)
+                         
+                         # --- Store metadata for the shard ---
+                         await self._store_shard_metadata(video_id, chunk_index, original_size, encoded_size, shard_location)
                      except IOError as e:
                          logging.error(f"[{self.worker_id}] Failed to write shard file '{shard_path}': {e}")
                          context.set_details(f"Failed to store shard: {e}")
@@ -105,6 +118,30 @@ class VideoProcessingWorker(replication_pb2_grpc.VideoProcessingServiceServicer)
             async with self._active_tasks_lock:
                 self._active_tasks -= 1
 
+    async def _store_shard_metadata(self, video_id: str, chunk_index: int, original_size: int, encoded_size: int, shard_location: str):
+        """Stores metadata for a processed shard."""
+        metadata = {
+            "video_id": video_id,
+            "chunk_index": chunk_index,
+            "original_size": original_size,
+            "encoded_size": encoded_size,
+            "compression_ratio": encoded_size / original_size if original_size > 0 else 0,
+            "worker_id": self.worker_id,
+            "shard_location": shard_location,
+            "timestamp": datetime.now().isoformat()
+        }
+        
+        metadata_filename = f"{video_id}_chunk_{chunk_index}_metadata.json"
+        metadata_path = os.path.join(METADATA_DIR, metadata_filename)
+        
+        async with self._metadata_lock:
+            try:
+                with open(metadata_path, "w") as f:
+                    json.dump(metadata, f, indent=2)
+                logging.info(f"[{self.worker_id}] Stored metadata for chunk {chunk_index} of video '{video_id}'")
+            except IOError as e:
+                logging.error(f"[{self.worker_id}] Failed to write metadata file '{metadata_path}': {e}")
+
     async def GetShard(self, request: replication_pb2.GetShardRequest, context: grpc.aio.ServicerContext) -> replication_pb2.GetShardResponse:
         """Retrieves the content of a stored shard file."""
         shard_location = request.shard_location
@@ -112,7 +149,6 @@ class VideoProcessingWorker(replication_pb2_grpc.VideoProcessingServiceServicer)
 
         # Basic validation: Ensure the requested path is within the SHARDS_DIR
         # This prevents clients from requesting arbitrary files on the worker's filesystem.
-        # A more robust check might resolve symlinks, etc.
         abs_shard_location = os.path.abspath(shard_location)
         abs_shards_dir = os.path.abspath(SHARDS_DIR)
 
@@ -209,6 +245,146 @@ class VideoProcessingWorker(replication_pb2_grpc.VideoProcessingServiceServicer)
                 memory_usage_bytes=0,
                 active_tasks=0,
                 message=f"Health check failed: {str(e)}"
+            )
+    
+    async def ListShards(self, request: replication_pb2.ListShardsRequest, context: grpc.aio.ServicerContext) -> replication_pb2.ListShardsResponse:
+        """Lists all shards for a video or all videos stored on this worker."""
+        try:
+            video_id = request.video_id  # Empty string means list all videos
+            logging.info(f"[{self.worker_id}] Received ListShards request for video_id='{video_id}'")
+            
+            if (video_id):
+                # List shards for a specific video
+                video_dir = os.path.join(SHARDS_DIR, video_id)
+                if not os.path.exists(video_dir) or not os.path.isdir(video_dir):
+                    logging.warning(f"[{self.worker_id}] Video directory not found: '{video_dir}'")
+                    return replication_pb2.ListShardsResponse(
+                        success=False,
+                        worker_id=self.worker_id,
+                        message=f"Video '{video_id}' not found on this worker",
+                        videos=[]
+                    )
+                
+                # Get shard information for the specific video
+                shard_files = [f for f in os.listdir(video_dir) if f.endswith('.shard')]
+                chunks = []
+                
+                for shard_file in shard_files:
+                    chunk_index = int(shard_file.split('_')[1].split('.')[0])
+                    shard_path = os.path.join(video_dir, shard_file)
+                    chunks.append(replication_pb2.ChunkInfo(
+                        chunk_index=chunk_index,
+                        shard_location=os.path.abspath(shard_path),
+                        size_bytes=os.path.getsize(shard_path)
+                    ))
+                
+                videos = [replication_pb2.VideoInfo(
+                    video_id=video_id,
+                    chunks=chunks
+                )]
+                
+                return replication_pb2.ListShardsResponse(
+                    success=True,
+                    worker_id=self.worker_id,
+                    message=f"Found {len(chunks)} shards for video '{video_id}'",
+                    videos=videos
+                )
+            else:
+                # List all videos
+                videos = []
+                
+                # Only consider directories in SHARDS_DIR (excluding metadata)
+                for dir_name in os.listdir(SHARDS_DIR):
+                    dir_path = os.path.join(SHARDS_DIR, dir_name)
+                    if os.path.isdir(dir_path) and dir_name != "metadata":
+                        shard_files = [f for f in os.listdir(dir_path) if f.endswith('.shard')]
+                        chunks = []
+                        
+                        for shard_file in shard_files:
+                            chunk_index = int(shard_file.split('_')[1].split('.')[0])
+                            shard_path = os.path.join(dir_path, shard_file)
+                            chunks.append(replication_pb2.ChunkInfo(
+                                chunk_index=chunk_index,
+                                shard_location=os.path.abspath(shard_path),
+                                size_bytes=os.path.getsize(shard_path)
+                            ))
+                        
+                        videos.append(replication_pb2.VideoInfo(
+                            video_id=dir_name,
+                            chunks=chunks
+                        ))
+                
+                return replication_pb2.ListShardsResponse(
+                    success=True,
+                    worker_id=self.worker_id,
+                    message=f"Found {len(videos)} videos with shards",
+                    videos=videos
+                )
+                
+        except Exception as e:
+            logging.error(f"[{self.worker_id}] Error in ListShards: {e}", exc_info=True)
+            return replication_pb2.ListShardsResponse(
+                success=False,
+                worker_id=self.worker_id,
+                message=f"Error listing shards: {str(e)}",
+                videos=[]
+            )
+
+    async def GetVideoMetadata(self, request: replication_pb2.GetVideoMetadataRequest, context: grpc.aio.ServicerContext) -> replication_pb2.GetVideoMetadataResponse:
+        """Retrieves metadata for all chunks of a specific video."""
+        try:
+            video_id = request.video_id
+            logging.info(f"[{self.worker_id}] Received GetVideoMetadata request for video_id='{video_id}'")
+            
+            # Find all metadata files for this video
+            metadata_files = [f for f in os.listdir(METADATA_DIR) 
+                             if f.startswith(f"{video_id}_chunk_") and f.endswith("_metadata.json")]
+            
+            if not metadata_files:
+                logging.warning(f"[{self.worker_id}] No metadata found for video '{video_id}'")
+                return replication_pb2.GetVideoMetadataResponse(
+                    success=False,
+                    worker_id=self.worker_id,
+                    message=f"No metadata found for video '{video_id}'",
+                    chunks_metadata=[]
+                )
+            
+            chunks_metadata = []
+            async with self._metadata_lock:
+                for metadata_file in metadata_files:
+                    metadata_path = os.path.join(METADATA_DIR, metadata_file)
+                    try:
+                        with open(metadata_path, 'r') as f:
+                            metadata = json.load(f)
+                            
+                        chunks_metadata.append(replication_pb2.ChunkMetadata(
+                            chunk_index=metadata["chunk_index"],
+                            original_size=metadata["original_size"],
+                            encoded_size=metadata["encoded_size"],
+                            compression_ratio=metadata["compression_ratio"],
+                            shard_location=metadata["shard_location"],
+                            timestamp=metadata["timestamp"]
+                        ))
+                    except (IOError, json.JSONDecodeError) as e:
+                        logging.error(f"[{self.worker_id}] Error reading metadata file '{metadata_path}': {e}")
+            
+            # Sort chunks by index for consistent response
+            chunks_metadata.sort(key=lambda x: x.chunk_index)
+            
+            return replication_pb2.GetVideoMetadataResponse(
+                success=True,
+                worker_id=self.worker_id,
+                message=f"Retrieved metadata for {len(chunks_metadata)} chunks of video '{video_id}'",
+                chunks_metadata=chunks_metadata
+            )
+            
+        except Exception as e:
+            logging.error(f"[{self.worker_id}] Error in GetVideoMetadata: {e}", exc_info=True)
+            return replication_pb2.GetVideoMetadataResponse(
+                success=False,
+                worker_id=self.worker_id,
+                message=f"Error retrieving video metadata: {str(e)}",
+                chunks_metadata=[]
             )
 
 

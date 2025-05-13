@@ -1,0 +1,8 @@
+ffmpeg==1.4
+ffmpeg-python==0.2.0
+future==1.0.0
+grpcio==1.71.0
+grpcio-tools==1.71.0
+protobuf==5.29.4
+psutil==7.0.0
+setuptools==80.4.0

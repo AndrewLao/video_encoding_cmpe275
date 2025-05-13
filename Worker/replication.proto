@@ -2,17 +2,15 @@ syntax = "proto3";
 
 package replication;
 
-import "google/protobuf/timestamp.proto";
-
-// Service definition for replication
-service ReplicationService {
-  rpc Write (WriteRequest) returns (WriteResponse);
-  rpc Read (ReadRequest) returns (ReadResponse);
-
-  // Internal requests for NWR replication
-  rpc InternalWrite (InternalWriteRequest) returns (InternalWriteResponse);
-  rpc InternalRead (InternalReadRequest) returns (InternalReadResponse);
-  rpc GetStatus (GetStatusRequest) returns (GetStatusResponse);
+// Service for client-master interactions and master-side operations
+service MasterService {
+  // Client streams UploadVideoChunk messages, server responds with one UploadVideoResponse
+  rpc UploadVideo (stream UploadVideoChunk) returns (UploadVideoResponse);
+  // Server streams RetrieveVideoChunk messages, client receives the stream
+  rpc RetrieveVideo (RetrieveVideoRequest) returns (stream RetrieveVideoChunk);
+  rpc GetVideoStatus (VideoStatusRequest) returns (VideoStatusResponse);
+  // For workers to report shard processing status to the master
+  rpc ReportWorkerShardStatus (ReportWorkerShardStatusRequest) returns (ReportWorkerShardStatusResponse);
 }
 
 // Service definition for video processing workers
@@ -23,110 +21,178 @@ service VideoProcessingService {
   rpc GetShard (GetShardRequest) returns (GetShardResponse);
   // RPC for master to check health of worker nodes
   rpc CheckHealth (HealthCheckRequest) returns (HealthCheckResponse);
+
   // RPC for listing shards stored on a worker
   rpc ListShards (ListShardsRequest) returns (ListShardsResponse);
   // RPC for getting metadata for all chunks of a video
   rpc GetVideoMetadata (GetVideoMetadataRequest) returns (GetVideoMetadataResponse);
+  
+// Service for master-worker interactions (processing video shards)
+service WorkerService {
+  // Master sends shard to worker for processing (e.g., resizing)
+  rpc ProcessShard (DistributeShardRequest) returns (ProcessShardResponse);
+  // Master requests a processed shard from a worker
+  rpc RequestShard (RequestShardRequest) returns (RequestShardResponse);
 }
 
-// --- Client Requests/Responses (Existing) ---
-
-message WriteRequest {
-  string key = 1;
-  string value = 2;
+// Service for inter-node communication (e.g., elections, health checks)
+service NodeService {
+  rpc AnnounceMaster (MasterAnnouncement) returns (MasterAnnouncementResponse);
+  rpc RequestVote (VoteRequest) returns (VoteResponse);
+  rpc GetNodeStats (NodeStatsRequest) returns (NodeStatsResponse);
+  // New RPC for clients or other nodes to discover the current master
+  rpc GetCurrentMaster (GetCurrentMasterRequest) returns (GetCurrentMasterResponse);
 }
 
-message WriteResponse {
-  bool success = 1;
-  string message = 2;
-  double time_taken = 3;
+// --- Message Definitions ---
+
+// For MasterService.UploadVideo (Streaming Request)
+// The first message in the stream will contain metadata and the first chunk.
+// Subsequent messages will contain only data chunks.
+message UploadVideoChunk {
+  string   video_id           = 1;
+  bytes    data_chunk         = 2;
+  bool     is_first_chunk     = 3;
+  int32    target_width       = 4;  // existing
+  int32    target_height      = 5;  // existing
+  int32    upscale_width      = 6;  // new
+  int32    upscale_height     = 7;  // new
+  string   output_format      = 8;  // new, e.g. "mp4", "mkv", "webm"
+  string   original_filename  = 9;
 }
 
-message ReadRequest {
-  string key = 1;
+
+message UploadVideoResponse {
+  string video_id = 1; // The definitive ID assigned by the master
+  bool success = 2;
+  string message = 3;
 }
 
-message ReadResponse {
-  bool success = 1;
-  string value = 2;
-  google.protobuf.Timestamp timestamp = 3;
-  string message = 4;
-  double time_taken = 5;
-}
-
-// --- Internal Requests/Responses (Existing) ---
-
-message InternalWriteRequest {
-  string key = 1;
-  string value = 2;
-  google.protobuf.Timestamp timestamp = 3;
-  string coordinator_id = 4;
-}
-
-message InternalWriteResponse {
-  bool success = 1;
-  string server_id = 2;
-  string key = 3;
-  google.protobuf.Timestamp timestamp = 4;
-  string message = 5;
-}
-
-message InternalReadRequest {
-  string key = 1;
-}
-
-message InternalReadResponse {
-  bool found = 1;
-  string value = 2;
-  google.protobuf.Timestamp timestamp = 3;
-  string server_id = 4;
-  string key = 5;
-  string message = 6;
-}
-
-// --- Status (Existing) ---
-
-message GetStatusRequest {
-}
-
-message GetStatusResponse {
-  string server_id = 1;
-  int32 message_queue_size = 2;
-  float latency_ms = 3;
-  float cpu_utilization = 4;
-  int64 memory_usage_bytes = 5;
-  google.protobuf.Timestamp last_update_time = 6;
-  int32 simulated_distance = 7;
-  int32 messages_stolen_recent = 8;
-}
-
-// --- Video Processing Messages (Existing) ---
-
-message ProcessChunkRequest {
+// For MasterService.RetrieveVideo (Streaming Response)
+message RetrieveVideoRequest {
   string video_id = 1;
-  int32 chunk_index = 2;
-  bytes chunk_data = 3;
 }
 
-message ProcessChunkResponse {
-  bool success = 1;
-  string worker_id = 2;
-  string shard_location = 3; // Path or identifier where the shard was stored
-  int64 original_size = 4;
-  int64 encoded_size = 5;
-  string message = 6;
+message RetrieveVideoChunk {
+  string video_id = 1; // Include video_id for context
+  bytes data_chunk = 2; // A chunk of the processed video data
+  // Could add sequence number or is_last_chunk if needed, but gRPC stream handles end
 }
 
-// --- Get Shard Messages (New) ---
 
-message GetShardRequest {
-  string shard_location = 1; // The path or identifier of the shard to retrieve
+// For MasterService.GetVideoStatus
+message VideoStatusRequest {
+  string video_id = 1;
 }
 
-message GetShardResponse {
-  bool success = 1;
-  bytes shard_data = 2; // The binary content of the shard file
-  string message = 3; // Status or error message
+message VideoStatusResponse {
+  string video_id = 1;
+  string status = 2;      // e.g., "processing", "completed", "failed", "not_found"
+  string message = 3;      // More detailed information
+}
+
+// For MasterService.ReportWorkerShardStatus
+message ReportWorkerShardStatusRequest {
+    string video_id = 1;
+    string shard_id = 2;
+    string worker_address = 3;
+    string status = 4; // e.g. "processed_successfully", "failed_processing"
+}
+
+message ReportWorkerShardStatusResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+
+// For WorkerService.ProcessShard (Master sends this to Worker)
+// Note: This request is also named DistributeShardRequest in the node.py logic
+// as it contains all info for distribution and subsequent processing.
+message DistributeShardRequest {
+  string video_id = 1;
+  string shard_id = 2;
+  bytes shard_data = 3;
+  int32 shard_index = 4;
+  int32 total_shards = 5;
+  int32 target_width = 6;
+  int32 target_height = 7;
+  string original_filename = 8; // Useful for worker to know original extension
+}
+
+message ProcessShardResponse {
+  string shard_id = 1;
+  bool success = 2;
+  string message = 3;
+}
+
+// For WorkerService.RequestShard (Master requests this from Worker)
+message RequestShardRequest {
+  string shard_id = 1;
+}
+
+message RequestShardResponse {
+  string shard_id = 1;
+  bytes shard_data = 2;      // The processed shard data
+  bool success = 3;
+  string message = 4;
+}
+
+// For NodeService.AnnounceMaster
+message MasterAnnouncement {
+  string master_address = 1;  // e.g., "host:port"
+  string node_id_of_master = 2; // Unique ID of the node that is master
+  int32 term = 3; // The current term of the master
+}
+
+message MasterAnnouncementResponse {
+  string status = 1;          // e.g., "Acknowledged by <node_id>"
+  string node_id = 2; // The ID of the responding node
+}
+
+// For NodeService.RequestVote
+message VoteRequest {
+  string candidate_id = 1;     // Unique ID of the node requesting votes
+  string candidate_address = 2; // Network address of the candidate
+  int32 term = 3; // The candidate's term
+}
+
+message VoteResponse {
+  bool vote_granted = 1;
+  string voter_id = 2;          // Unique ID of the node casting this vote
+  string voter_address = 3;     // Network address of the voter
+}
+
+// For NodeService.GetNodeStats
+message NodeStatsRequest {
+  // No parameters needed for now, could add specific stat requests later
+}
+
+message NodeStatsResponse {
+  string node_id = 1;
+  string node_address = 2;
+  bool is_master = 3;
+  string current_master_address = 4;
+  float cpu_utilization = 5;
+  float memory_utilization = 6;
+  int64 disk_space_free_shards = 7;    // Free space in worker's shard directory
+  int64 disk_space_total_shards = 8;  // Total space in worker's shard directory
+  int64 disk_space_free_masterdata = 9; // Free space in master's data directory
+  int64 disk_space_total_masterdata = 10;// Total space in master's data directory
+  int32 active_tasks = 11;             // Placeholder for active processing tasks
+  int32 known_nodes_count = 12;        // Number of other nodes this node is aware of
+  bool election_in_progress = 13;
+  int32 current_term = 14; // The current term of this node
+}
+
+// For NodeService.GetCurrentMaster
+message GetCurrentMasterRequest {
+    // No fields needed
+}
+
+message GetCurrentMasterResponse {
+    string master_address = 1; // The address of the current master
+    int32 term = 2; // The current term of the master
+    bool is_master_known = 3; // Indicates if this node knows who the master is
 }
 
 // --- Health Check Messages (New) ---

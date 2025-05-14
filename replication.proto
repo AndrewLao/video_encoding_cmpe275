@@ -23,10 +23,10 @@ service WorkerService {
 
 // Service for inter-node communication (e.g., elections, health checks)
 service NodeService {
-  rpc AnnounceMaster (MasterAnnouncement) returns (MasterAnnouncementResponse);
+  // Master sends heartbeat/announcement, follower replies with its stats
+  rpc AnnounceMaster (MasterAnnouncementRequest) returns (MasterAnnouncementReply);
   rpc RequestVote (VoteRequest) returns (VoteResponse);
-  rpc GetNodeStats (NodeStatsRequest) returns (NodeStatsResponse);
-  // New RPC for clients or other nodes to discover the current master
+  // RPC for clients or other nodes to discover the current master
   rpc GetCurrentMaster (GetCurrentMasterRequest) returns (GetCurrentMasterResponse);
 }
 
@@ -39,11 +39,11 @@ message UploadVideoChunk {
   string   video_id           = 1;
   bytes    data_chunk         = 2;
   bool     is_first_chunk     = 3;
-  int32    target_width       = 4;  // existing
-  int32    target_height      = 5;  // existing
-  int32    upscale_width      = 6;  // new
-  int32    upscale_height     = 7;  // new
-  string   output_format      = 8;  // new, e.g. "mp4", "mkv", "webm"
+  int32    target_width       = 4;
+  int32    target_height      = 5;
+  int32    upscale_width      = 6;
+  int32    upscale_height     = 7;
+  string   output_format      = 8; // e.g. "mp4", "mkv", "webm"
   string   original_filename  = 9;
 }
 
@@ -74,7 +74,7 @@ message VideoStatusRequest {
 message VideoStatusResponse {
   string video_id = 1;
   string status = 2;      // e.g., "processing", "completed", "failed", "not_found"
-  string message = 3;      // More detailed information
+  string message = 3;     // More detailed information
 }
 
 // For MasterService.ReportWorkerShardStatus
@@ -102,9 +102,11 @@ message DistributeShardRequest {
   int32 total_shards = 5;
   int32 target_width = 6;
   int32 target_height = 7;
-  string original_filename = 8; // Useful for worker to know original extension
+  string original_filename = 8;
+  int32 upscale_width = 9;   // Add this line
+  int32 upscale_height = 10; // Add this line
+  string output_format = 11;
 }
-
 message ProcessShardResponse {
   string shard_id = 1;
   bool success = 2;
@@ -123,29 +125,48 @@ message RequestShardResponse {
   string message = 4;
 }
 
-// For NodeService.AnnounceMaster
-message MasterAnnouncement {
+// For NodeService.AnnounceMaster (Request message)
+message MasterAnnouncementRequest {
   string master_address = 1;  // e.g., "host:port"
   string node_id_of_master = 2; // Unique ID of the node that is master
   int32 term = 3; // The current term of the master
+  // Add any other necessary information from the master to followers
 }
 
-message MasterAnnouncementResponse {
-  string status = 1;          // e.g., "Acknowledged by <node_id>"
-  string node_id = 2; // The ID of the responding node
+// Message to carry per-node statistics
+message NodeStats {
+  string node_id = 1;
+  int32  shard_count = 2; // Example stat: number of active processing tasks
+  // Add any other per-node metrics you care about (CPU, memory, disk, etc.)
+  float cpu_utilization = 3;
+  float memory_utilization = 4;
+  int64 disk_space_free_shards = 5;
+  int64 disk_space_total_shards = 6;
 }
+
+
+// For NodeService.AnnounceMaster (Reply message)
+message MasterAnnouncementReply {
+  string status = 1;           // e.g., "Acknowledged by <node_id>"
+  string node_id = 2; // The ID of the responding node
+  // Add any other necessary information from the follower to the master
+  repeated NodeStats follower_stats = 10; // Include the follower's stats
+}
+
 
 // For NodeService.RequestVote
 message VoteRequest {
-  string candidate_id = 1;     // Unique ID of the node requesting votes
+  string candidate_id = 1;    // Unique ID of the node requesting votes
   string candidate_address = 2; // Network address of the candidate
   int32 term = 3; // The candidate's term
 }
 
 message VoteResponse {
   bool vote_granted = 1;
-  string voter_id = 2;          // Unique ID of the node casting this vote
-  string voter_address = 3;     // Network address of the voter
+  string voter_id = 2;         // Unique ID of the node casting this vote
+  string voter_address = 3;    // Network address of the voter
+  // In a full Raft implementation, you'd also include the voter's current term here
+  int32 term = 4;
 }
 
 // For NodeService.GetNodeStats
@@ -160,8 +181,8 @@ message NodeStatsResponse {
   string current_master_address = 4;
   float cpu_utilization = 5;
   float memory_utilization = 6;
-  int64 disk_space_free_shards = 7;    // Free space in worker's shard directory
-  int64 disk_space_total_shards = 8;  // Total space in worker's shard directory
+  int64 disk_space_free_shards = 7;   // Free space in worker's shard directory
+  int64 disk_space_total_shards = 8; // Total space in worker's shard directory
   int64 disk_space_free_masterdata = 9; // Free space in master's data directory
   int64 disk_space_total_masterdata = 10;// Total space in master's data directory
   int32 active_tasks = 11;             // Placeholder for active processing tasks

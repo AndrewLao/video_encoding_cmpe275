@@ -23,6 +23,7 @@ METADATA_DIR = os.path.join(SHARDS_DIR, "metadata")
 os.makedirs(SHARDS_DIR, exist_ok=True)
 os.makedirs(METADATA_DIR, exist_ok=True)
 logging.info(f"Ensured shards directory structure exists at: {os.path.abspath(SHARDS_DIR)}")
+logging.info(f"Ensured metadata directory exists at: {os.path.abspath(METADATA_DIR)}")
 
 class VideoProcessingWorker(replication_pb2_grpc.VideoProcessingServiceServicer):
     """Implements the VideoProcessingService for workers."""
@@ -78,7 +79,19 @@ class VideoProcessingWorker(replication_pb2_grpc.VideoProcessingServiceServicer)
                          shard_location = os.path.abspath(shard_path)
                          
                          # --- Store metadata for the shard ---
-                         await self._store_shard_metadata(video_id, chunk_index, original_size, encoded_size, shard_location)
+                         metadata_result = await self._store_shard_metadata(video_id, chunk_index, original_size, encoded_size, shard_location)
+                         if not metadata_result:
+                             logging.error(f"[{self.worker_id}] Failed to store metadata for chunk {chunk_index}")
+                             context.set_details("Failed to store shard metadata")
+                             context.set_code(grpc.StatusCode.INTERNAL)
+                             return replication_pb2.ProcessChunkResponse(
+                                 success=False,
+                                 worker_id=self.worker_id,
+                                 shard_location="",
+                                 original_size=original_size,
+                                 encoded_size=0,
+                                 message="Failed to store shard metadata"
+                             )
                      except IOError as e:
                          logging.error(f"[{self.worker_id}] Failed to write shard file '{shard_path}': {e}")
                          context.set_details(f"Failed to store shard: {e}")
@@ -120,6 +133,7 @@ class VideoProcessingWorker(replication_pb2_grpc.VideoProcessingServiceServicer)
 
     async def _store_shard_metadata(self, video_id: str, chunk_index: int, original_size: int, encoded_size: int, shard_location: str):
         """Stores metadata for a processed shard."""
+        # Create metadata with required fields
         metadata = {
             "video_id": video_id,
             "chunk_index": chunk_index,
@@ -131,6 +145,13 @@ class VideoProcessingWorker(replication_pb2_grpc.VideoProcessingServiceServicer)
             "timestamp": datetime.now().isoformat()
         }
         
+        # Validate metadata schema
+        required_keys = ["video_id", "chunk_index", "original_size", "encoded_size", 
+                         "compression_ratio", "worker_id", "shard_location", "timestamp"]
+        if not all(k in metadata for k in required_keys):
+            logging.error(f"[{self.worker_id}] Invalid metadata schema for chunk {chunk_index} of video '{video_id}'")
+            return False
+        
         metadata_filename = f"{video_id}_chunk_{chunk_index}_metadata.json"
         metadata_path = os.path.join(METADATA_DIR, metadata_filename)
         
@@ -139,8 +160,10 @@ class VideoProcessingWorker(replication_pb2_grpc.VideoProcessingServiceServicer)
                 with open(metadata_path, "w") as f:
                     json.dump(metadata, f, indent=2)
                 logging.info(f"[{self.worker_id}] Stored metadata for chunk {chunk_index} of video '{video_id}'")
+                return True
             except IOError as e:
                 logging.error(f"[{self.worker_id}] Failed to write metadata file '{metadata_path}': {e}")
+                return False
 
     async def GetShard(self, request: replication_pb2.GetShardRequest, context: grpc.aio.ServicerContext) -> replication_pb2.GetShardResponse:
         """Retrieves the content of a stored shard file."""
@@ -253,7 +276,7 @@ class VideoProcessingWorker(replication_pb2_grpc.VideoProcessingServiceServicer)
             video_id = request.video_id  # Empty string means list all videos
             logging.info(f"[{self.worker_id}] Received ListShards request for video_id='{video_id}'")
             
-            if (video_id):
+            if video_id:
                 # List shards for a specific video
                 video_dir = os.path.join(SHARDS_DIR, video_id)
                 if not os.path.exists(video_dir) or not os.path.isdir(video_dir):
@@ -346,7 +369,16 @@ class VideoProcessingWorker(replication_pb2_grpc.VideoProcessingServiceServicer)
                     success=False,
                     worker_id=self.worker_id,
                     message=f"No metadata found for video '{video_id}'",
-                    chunks_metadata=[]
+                    chunks_metadata=[],
+                    video_metadata=replication_pb2.VideoMetadata(
+                        video_id=video_id,
+                        duration="Unknown",
+                        resolution="Unknown",
+                        codec="Unknown",
+                        total_size=0,
+                        total_chunks=0,
+                        creation_timestamp=datetime.now().isoformat()
+                    )
                 )
             
             chunks_metadata = []
@@ -371,11 +403,27 @@ class VideoProcessingWorker(replication_pb2_grpc.VideoProcessingServiceServicer)
             # Sort chunks by index for consistent response
             chunks_metadata.sort(key=lambda x: x.chunk_index)
             
+            # Calculate total size and other aggregated metadata
+            total_original_size = sum(metadata.original_size for metadata in chunks_metadata)
+            total_encoded_size = sum(metadata.encoded_size for metadata in chunks_metadata)
+            
+            # Create aggregated video metadata
+            video_metadata = replication_pb2.VideoMetadata(
+                video_id=video_id,
+                duration="Unknown",  # This would need an actual video parser to determine
+                resolution="Unknown",  # This would need an actual video parser to determine
+                codec="Unknown",      # This would need an actual video parser to determine
+                total_size=total_encoded_size,
+                total_chunks=len(chunks_metadata),
+                creation_timestamp=chunks_metadata[0].timestamp if chunks_metadata else datetime.now().isoformat()
+            )
+            
             return replication_pb2.GetVideoMetadataResponse(
                 success=True,
                 worker_id=self.worker_id,
                 message=f"Retrieved metadata for {len(chunks_metadata)} chunks of video '{video_id}'",
-                chunks_metadata=chunks_metadata
+                chunks_metadata=chunks_metadata,
+                video_metadata=video_metadata
             )
             
         except Exception as e:
@@ -384,7 +432,16 @@ class VideoProcessingWorker(replication_pb2_grpc.VideoProcessingServiceServicer)
                 success=False,
                 worker_id=self.worker_id,
                 message=f"Error retrieving video metadata: {str(e)}",
-                chunks_metadata=[]
+                chunks_metadata=[],
+                video_metadata=replication_pb2.VideoMetadata(
+                    video_id=request.video_id,
+                    duration="Unknown",
+                    resolution="Unknown",
+                    codec="Unknown",
+                    total_size=0,
+                    total_chunks=0,
+                    creation_timestamp=datetime.now().isoformat()
+                )
             )
 
 

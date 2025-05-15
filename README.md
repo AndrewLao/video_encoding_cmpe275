@@ -19,12 +19,6 @@ This project implements a fault-tolerant distributed system for video encoding a
 - **Dependency Management:** Setup script automates virtual environment creation and dependency installation.
 - **Helper Scripts:** Scripts are provided for setting up the environment, starting master/worker nodes, running test clients, creating test videos, and cleaning up processes.
 
-If there is a * next to the issue, that means it's a desired but not essential feature.
-
-# Video Processing Worker Guide
-
-This project implements a standalone Video Processing Worker using gRPC in Python. It's designed to receive video chunks from a Master process (simulated by the test client), simulate encoding them to make them smaller, and store them as local shards. It also provides an RPC to retrieve the stored shard files.
-
 ## Architecture
 
 ```mermaid

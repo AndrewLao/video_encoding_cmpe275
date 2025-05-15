@@ -21,12 +21,12 @@ service VideoProcessingService {
   rpc GetShard (GetShardRequest) returns (GetShardResponse);
   // RPC for master to check health of worker nodes
   rpc CheckHealth (HealthCheckRequest) returns (HealthCheckResponse);
-
   // RPC for listing shards stored on a worker
   rpc ListShards (ListShardsRequest) returns (ListShardsResponse);
   // RPC for getting metadata for all chunks of a video
   rpc GetVideoMetadata (GetVideoMetadataRequest) returns (GetVideoMetadataResponse);
-  
+}
+
 // Service for master-worker interactions (processing video shards)
 service WorkerService {
   // Master sends shard to worker for processing (e.g., resizing)
@@ -195,7 +195,7 @@ message GetCurrentMasterResponse {
     bool is_master_known = 3; // Indicates if this node knows who the master is
 }
 
-// --- Health Check Messages (New) ---
+// --- Health Check Messages ---
 
 message HealthCheckRequest {
   string master_id = 1; // Identifier of the master requesting the health check
@@ -210,7 +210,7 @@ message HealthCheckResponse {
   string message = 6; // Additional health information or error message
 }
 
-// --- Shard Listing Messages (New) ---
+// --- Shard Listing Messages ---
 
 message ListShardsRequest {
   string video_id = 1; // Optional: If specified, list only shards for this video; if empty, list all videos
@@ -234,10 +234,20 @@ message ListShardsResponse {
   repeated VideoInfo videos = 4; // Information about videos and their shards
 }
 
-// --- Video Metadata Messages (New) ---
+// --- Video Metadata Messages ---
 
 message GetVideoMetadataRequest {
   string video_id = 1; // Identifier for the video to get metadata for
+}
+
+message VideoMetadata {
+  string video_id = 1;
+  string duration = 2;
+  string resolution = 3;
+  string codec = 4;
+  int64 total_size = 5;
+  int64 total_chunks = 6;
+  string creation_timestamp = 7;
 }
 
 message ChunkMetadata {
@@ -254,4 +264,34 @@ message GetVideoMetadataResponse {
   string worker_id = 2; // Identifier of the worker responding
   string message = 3; // Status or error message
   repeated ChunkMetadata chunks_metadata = 4; // Metadata for each chunk
+  VideoMetadata video_metadata = 5; // Overall video metadata
+}
+
+// --- Video Processing Messages ---
+
+message ProcessChunkRequest {
+  string video_id = 1;
+  int32 chunk_index = 2;
+  bytes chunk_data = 3;
+}
+
+message ProcessChunkResponse {
+  bool success = 1;
+  string worker_id = 2;
+  string shard_location = 3; // Path or identifier where the shard was stored
+  int64 original_size = 4;
+  int64 encoded_size = 5;
+  string message = 6;
+}
+
+// --- Get Shard Messages ---
+
+message GetShardRequest {
+  string shard_location = 1; // The path or identifier of the shard to retrieve
+}
+
+message GetShardResponse {
+  bool success = 1;
+  bytes shard_data = 2; // The binary content of the shard file
+  string message = 3; // Status or error message
 }

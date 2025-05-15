@@ -1,0 +1,297 @@
+syntax = "proto3";
+
+package replication;
+
+// Service for client-master interactions and master-side operations
+service MasterService {
+  // Client streams UploadVideoChunk messages, server responds with one UploadVideoResponse
+  rpc UploadVideo (stream UploadVideoChunk) returns (UploadVideoResponse);
+  // Server streams RetrieveVideoChunk messages, client receives the stream
+  rpc RetrieveVideo (RetrieveVideoRequest) returns (stream RetrieveVideoChunk);
+  rpc GetVideoStatus (VideoStatusRequest) returns (VideoStatusResponse);
+  // For workers to report shard processing status to the master
+  rpc ReportWorkerShardStatus (ReportWorkerShardStatusRequest) returns (ReportWorkerShardStatusResponse);
+}
+
+// Service definition for video processing workers
+service VideoProcessingService {
+  // RPC for master to send a video chunk to a worker for processing
+  rpc ProcessChunk (ProcessChunkRequest) returns (ProcessChunkResponse);
+  // RPC for client/master to retrieve a processed shard file from a worker
+  rpc GetShard (GetShardRequest) returns (GetShardResponse);
+  // RPC for master to check health of worker nodes
+  rpc CheckHealth (HealthCheckRequest) returns (HealthCheckResponse);
+  // RPC for listing shards stored on a worker
+  rpc ListShards (ListShardsRequest) returns (ListShardsResponse);
+  // RPC for getting metadata for all chunks of a video
+  rpc GetVideoMetadata (GetVideoMetadataRequest) returns (GetVideoMetadataResponse);
+}
+
+// Service for master-worker interactions (processing video shards)
+service WorkerService {
+  // Master sends shard to worker for processing (e.g., resizing)
+  rpc ProcessShard (DistributeShardRequest) returns (ProcessShardResponse);
+  // Master requests a processed shard from a worker
+  rpc RequestShard (RequestShardRequest) returns (RequestShardResponse);
+}
+
+// Service for inter-node communication (e.g., elections, health checks)
+service NodeService {
+  rpc AnnounceMaster (MasterAnnouncement) returns (MasterAnnouncementResponse);
+  rpc RequestVote (VoteRequest) returns (VoteResponse);
+  rpc GetNodeStats (NodeStatsRequest) returns (NodeStatsResponse);
+  // New RPC for clients or other nodes to discover the current master
+  rpc GetCurrentMaster (GetCurrentMasterRequest) returns (GetCurrentMasterResponse);
+}
+
+// --- Message Definitions ---
+
+// For MasterService.UploadVideo (Streaming Request)
+// The first message in the stream will contain metadata and the first chunk.
+// Subsequent messages will contain only data chunks.
+message UploadVideoChunk {
+  string   video_id           = 1;
+  bytes    data_chunk         = 2;
+  bool     is_first_chunk     = 3;
+  int32    target_width       = 4;  // existing
+  int32    target_height      = 5;  // existing
+  int32    upscale_width      = 6;  // new
+  int32    upscale_height     = 7;  // new
+  string   output_format      = 8;  // new, e.g. "mp4", "mkv", "webm"
+  string   original_filename  = 9;
+}
+
+
+message UploadVideoResponse {
+  string video_id = 1; // The definitive ID assigned by the master
+  bool success = 2;
+  string message = 3;
+}
+
+// For MasterService.RetrieveVideo (Streaming Response)
+message RetrieveVideoRequest {
+  string video_id = 1;
+}
+
+message RetrieveVideoChunk {
+  string video_id = 1; // Include video_id for context
+  bytes data_chunk = 2; // A chunk of the processed video data
+  // Could add sequence number or is_last_chunk if needed, but gRPC stream handles end
+}
+
+
+// For MasterService.GetVideoStatus
+message VideoStatusRequest {
+  string video_id = 1;
+}
+
+message VideoStatusResponse {
+  string video_id = 1;
+  string status = 2;      // e.g., "processing", "completed", "failed", "not_found"
+  string message = 3;      // More detailed information
+}
+
+// For MasterService.ReportWorkerShardStatus
+message ReportWorkerShardStatusRequest {
+    string video_id = 1;
+    string shard_id = 2;
+    string worker_address = 3;
+    string status = 4; // e.g. "processed_successfully", "failed_processing"
+}
+
+message ReportWorkerShardStatusResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+
+// For WorkerService.ProcessShard (Master sends this to Worker)
+// Note: This request is also named DistributeShardRequest in the node.py logic
+// as it contains all info for distribution and subsequent processing.
+message DistributeShardRequest {
+  string video_id = 1;
+  string shard_id = 2;
+  bytes shard_data = 3;
+  int32 shard_index = 4;
+  int32 total_shards = 5;
+  int32 target_width = 6;
+  int32 target_height = 7;
+  string original_filename = 8; // Useful for worker to know original extension
+}
+
+message ProcessShardResponse {
+  string shard_id = 1;
+  bool success = 2;
+  string message = 3;
+}
+
+// For WorkerService.RequestShard (Master requests this from Worker)
+message RequestShardRequest {
+  string shard_id = 1;
+}
+
+message RequestShardResponse {
+  string shard_id = 1;
+  bytes shard_data = 2;      // The processed shard data
+  bool success = 3;
+  string message = 4;
+}
+
+// For NodeService.AnnounceMaster
+message MasterAnnouncement {
+  string master_address = 1;  // e.g., "host:port"
+  string node_id_of_master = 2; // Unique ID of the node that is master
+  int32 term = 3; // The current term of the master
+}
+
+message MasterAnnouncementResponse {
+  string status = 1;          // e.g., "Acknowledged by <node_id>"
+  string node_id = 2; // The ID of the responding node
+}
+
+// For NodeService.RequestVote
+message VoteRequest {
+  string candidate_id = 1;     // Unique ID of the node requesting votes
+  string candidate_address = 2; // Network address of the candidate
+  int32 term = 3; // The candidate's term
+}
+
+message VoteResponse {
+  bool vote_granted = 1;
+  string voter_id = 2;          // Unique ID of the node casting this vote
+  string voter_address = 3;     // Network address of the voter
+}
+
+// For NodeService.GetNodeStats
+message NodeStatsRequest {
+  // No parameters needed for now, could add specific stat requests later
+}
+
+message NodeStatsResponse {
+  string node_id = 1;
+  string node_address = 2;
+  bool is_master = 3;
+  string current_master_address = 4;
+  float cpu_utilization = 5;
+  float memory_utilization = 6;
+  int64 disk_space_free_shards = 7;    // Free space in worker's shard directory
+  int64 disk_space_total_shards = 8;  // Total space in worker's shard directory
+  int64 disk_space_free_masterdata = 9; // Free space in master's data directory
+  int64 disk_space_total_masterdata = 10;// Total space in master's data directory
+  int32 active_tasks = 11;             // Placeholder for active processing tasks
+  int32 known_nodes_count = 12;        // Number of other nodes this node is aware of
+  bool election_in_progress = 13;
+  int32 current_term = 14; // The current term of this node
+}
+
+// For NodeService.GetCurrentMaster
+message GetCurrentMasterRequest {
+    // No fields needed
+}
+
+message GetCurrentMasterResponse {
+    string master_address = 1; // The address of the current master
+    int32 term = 2; // The current term of the master
+    bool is_master_known = 3; // Indicates if this node knows who the master is
+}
+
+// --- Health Check Messages ---
+
+message HealthCheckRequest {
+  string master_id = 1; // Identifier of the master requesting the health check
+}
+
+message HealthCheckResponse {
+  bool is_healthy = 1; // Whether the worker is healthy
+  string worker_id = 2; // Identifier of the worker responding
+  float cpu_utilization = 3; // Current CPU utilization (0-100)
+  int64 memory_usage_bytes = 4; // Current memory usage in bytes
+  int32 active_tasks = 5; // Number of tasks currently being processed
+  string message = 6; // Additional health information or error message
+}
+
+// --- Shard Listing Messages ---
+
+message ListShardsRequest {
+  string video_id = 1; // Optional: If specified, list only shards for this video; if empty, list all videos
+}
+
+message ChunkInfo {
+  int32 chunk_index = 1; // Index of the chunk in the original video
+  string shard_location = 2; // Location where the shard is stored
+  int64 size_bytes = 3; // Size of the shard in bytes
+}
+
+message VideoInfo {
+  string video_id = 1; // Identifier for the video
+  repeated ChunkInfo chunks = 2; // Information about each chunk/shard
+}
+
+message ListShardsResponse {
+  bool success = 1; // Whether the operation was successful
+  string worker_id = 2; // Identifier of the worker responding
+  string message = 3; // Status or error message
+  repeated VideoInfo videos = 4; // Information about videos and their shards
+}
+
+// --- Video Metadata Messages ---
+
+message GetVideoMetadataRequest {
+  string video_id = 1; // Identifier for the video to get metadata for
+}
+
+message VideoMetadata {
+  string video_id = 1;
+  string duration = 2;
+  string resolution = 3;
+  string codec = 4;
+  int64 total_size = 5;
+  int64 total_chunks = 6;
+  string creation_timestamp = 7;
+}
+
+message ChunkMetadata {
+  int32 chunk_index = 1; // Index of the chunk in the original video
+  int64 original_size = 2; // Original size of the chunk in bytes
+  int64 encoded_size = 3; // Size after encoding in bytes
+  float compression_ratio = 4; // Ratio of encoded size to original size
+  string shard_location = 5; // Location where the shard is stored
+  string timestamp = 6; // When the chunk was processed
+}
+
+message GetVideoMetadataResponse {
+  bool success = 1; // Whether the operation was successful
+  string worker_id = 2; // Identifier of the worker responding
+  string message = 3; // Status or error message
+  repeated ChunkMetadata chunks_metadata = 4; // Metadata for each chunk
+  VideoMetadata video_metadata = 5; // Overall video metadata
+}
+
+// --- Video Processing Messages ---
+
+message ProcessChunkRequest {
+  string video_id = 1;
+  int32 chunk_index = 2;
+  bytes chunk_data = 3;
+}
+
+message ProcessChunkResponse {
+  bool success = 1;
+  string worker_id = 2;
+  string shard_location = 3; // Path or identifier where the shard was stored
+  int64 original_size = 4;
+  int64 encoded_size = 5;
+  string message = 6;
+}
+
+// --- Get Shard Messages ---
+
+message GetShardRequest {
+  string shard_location = 1; // The path or identifier of the shard to retrieve
+}
+
+message GetShardResponse {
+  bool success = 1;
+  bytes shard_data = 2; // The binary content of the shard file
+  string message = 3; // Status or error message
+}

@@ -183,11 +183,35 @@ class Node:
         ]
         self._server = grpc.aio.server(futures.ThreadPoolExecutor(max_workers=10), options=server_options)
 
+                # ------------------------------------------------------------------
+        # Bind the gRPC server on both IPv6 and IPv4, in a way that works
+        # on macOS (v6-only by default) *and* Windows/Linux (dual-stack).
+        # ------------------------------------------------------------------
         replication_pb2_grpc.NodeServiceServicer.__init__(self)
-        host, port = self.host, self.port
-        bind_addr = f'[::]:{port}'         # dual-stack (IPv6 + IPv4) on every OS
-        self._server.add_insecure_port(bind_addr)
-        logging.info(f"[{self.address}] gRPC bound to {bind_addr} (dual-stack)")
+
+        # Try IPv6 first – on Windows/Linux this usually gives dual-stack.
+        bound_v6 = self._server.add_insecure_port(f'[::]:{self.port}')
+
+        # If v6 bind failed (bound_v6 == 0) OR we know v6 is v6-only,
+        # add an explicit IPv4 socket.
+        if bound_v6 == 0:
+            bound_v4 = self._server.add_insecure_port(f'0.0.0.0:{self.port}')
+        else:
+            bound_v4 = 0  # we didn’t need a second socket
+
+        # If both attempts failed, abort with a clear message
+        if bound_v6 == 0 and bound_v4 == 0:
+            raise RuntimeError(
+                f"Could not bind gRPC server on port {self.port} (v4 or v6)."
+            )
+
+        logging.info(
+            f"[{self.address}] gRPC bound: "
+            f"v6={'ok' if bound_v6 else 'skip'}  "
+            f"v4={'ok' if bound_v4 else 'skip'}"
+        )
+        # ------------------------------------------------------------------
+
         replication_pb2_grpc.add_NodeServiceServicer_to_server(self, self._server)
 
         # —————————————————————————————————————————————————————————————————

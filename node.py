@@ -101,7 +101,8 @@ class Node:
             self._create_master_stubs(self.current_master_address)
 
             # let master know we exist
-            asyncio.create_task(self._register_with_master())
+            asyncio.create_task(self.retry_register_with_master())
+
 
 
         logging.info(f"[{self.address}] Initialized as {self.role.upper()}. Master is {self.current_master_address}. My ID: {self.id}. Current Term: {self.current_term}")
@@ -290,6 +291,27 @@ class Node:
         )
 
         await self._server.wait_for_termination()
+        
+    # Retries worker registration with the master until successful.
+    async def retry_register_with_master(self, interval: float = 5.0):
+        """Periodically attempts to register with master if not yet successful."""
+        while self.role == 'worker':
+            try:
+                # Ensure the master stub exists or recreate it if needed
+                if not self.master_stub:
+                    self._create_master_stubs(self.current_master_address)
+                       # Build and send the registration request to the master
+                req = replication_pb2.RegisterWorkerRequest(worker_address=self.address)
+                resp = await self.master_stub.RegisterWorker(req)
+                if resp.success:
+                    logging.info(f"[{self.address}] Successfully registered with master on retry: {resp.message}")
+                    return  # Stop retrying after success
+                else:
+                    logging.info(f"[{self.address}] Retry registration response: {resp.message}")
+            except Exception as e:
+                logging.warning(f"[{self.address}] Retry register failed: {e}")
+            await asyncio.sleep(interval)
+
 
     async def _query_node_for_master(self, node_stub: replication_pb2_grpc.NodeServiceStub, node_address: str) -> Tuple[str, bool, int]:
         """Queries a node for its master status and term."""

@@ -184,7 +184,10 @@ class Node:
         self._server = grpc.aio.server(futures.ThreadPoolExecutor(max_workers=10), options=server_options)
 
         replication_pb2_grpc.NodeServiceServicer.__init__(self)
-        self._server.add_insecure_port(self.address)
+        host, port = self.host, self.port
+        bind_addr = f'[::]:{port}'         # dual-stack (IPv6 + IPv4) on every OS
+        self._server.add_insecure_port(bind_addr)
+        logging.info(f"[{self.address}] gRPC bound to {bind_addr} (dual-stack)")
         replication_pb2_grpc.add_NodeServiceServicer_to_server(self, self._server)
 
         # —————————————————————————————————————————————————————————————————
@@ -291,7 +294,7 @@ class Node:
         )
 
         await self._server.wait_for_termination()
-        
+
     # Retries worker registration with the master until successful.
     async def retry_register_with_master(self, interval: float = 5.0):
         """Periodically attempts to register with master if not yet successful."""
@@ -1763,7 +1766,7 @@ class Node:
 
         if self._pre_election_delay_task and not self._pre_election_delay_task.done():
             self._pre_election_delay_task.cancel()  # Cancel any existing delay
-        self.election_timeout = random.uniform(10, 15)
+        self.election_timeout = random.uniform(50, 60)
         logging.info(f"[{self.address}] Starting pre-election delay for {self.election_timeout:.2f} seconds.")
         self._pre_election_delay_task = asyncio.create_task(self._election_delay_coro())
         self._background_tasks.append(self._pre_election_delay_task)

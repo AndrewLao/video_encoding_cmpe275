@@ -17,6 +17,13 @@ import sys
 import psutil
 import ffmpeg
 import random
+import sys
+IS_MACOS = sys.platform == 'darwin'
+
+RETRY_INTERVAL = 2.0 if not IS_MACOS else 5.0
+CONNECTION_TIMEOUT = 5.0 if not IS_MACOS else 10.0
+ELECTION_TIMEOUT_MIN = 10.0 if not IS_MACOS else 15.0
+ELECTION_TIMEOUT_MAX = 15.0 if not IS_MACOS else 20.0
 
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(levelname)s - %(message)s')
@@ -167,19 +174,19 @@ class Node:
         return self.master_stub
     
     
-    async def _register_with_master(self):
-        try:
-            req  = replication_pb2.RegisterWorkerRequest(worker_address=self.address)
-            resp = await self.master_stub.RegisterWorker(req)
-            logging.info(f"[{self.address}] Registered with master: {resp.message}")
-        except Exception as e:
-            logging.error(f"[{self.address}] Failed to register with master: {e}")
-
     async def start(self):
         """Starts the gRPC server and background routines."""
+        # First, ensure the socket is available (especially important on macOS)
+        if IS_MACOS:
+            socket_available = await self.ensure_socket_available()
+            if not socket_available:
+                logging.error(f"[{self.address}] Could not secure socket for binding after multiple attempts. Aborting startup.")
+                return  # Early return if socket isn't available
+        
         server_options = [
             ('grpc.max_send_message_length', MAX_GRPC_MESSAGE_LENGTH),
             ('grpc.max_receive_message_length', MAX_GRPC_MESSAGE_LENGTH),
+            ('grpc.so_reuseport', 1), # Enable socket reuse on macOS
         ]
         self._server = grpc.aio.server(futures.ThreadPoolExecutor(max_workers=10), options=server_options)
 
@@ -320,26 +327,76 @@ class Node:
         await self._server.wait_for_termination()
 
     # Retries worker registration with the master until successful.
-    async def retry_register_with_master(self, interval: float = 5.0):
+    async def retry_register_with_master(self, interval: float = None):
         """Periodically attempts to register with master if not yet successful."""
-        while self.role == 'worker':
+        if interval is None:
+            interval = 2.0 if not IS_MACOS else 5.0
+            
+        retry_count = 0
+        max_retries = 10 if not IS_MACOS else 20
+        
+        while self.role == 'worker' and retry_count < max_retries:
             try:
                 # Ensure the master stub exists or recreate it if needed
                 if not self.master_stub:
                     self._create_master_stubs(self.current_master_address)
-                       # Build and send the registration request to the master
+                    
+                # Use dynamic timeout based on retry count
+                timeout = min(5.0 + (retry_count * 0.5), 15.0)
+                
+                # Build and send the registration request to the master
                 req = replication_pb2.RegisterWorkerRequest(worker_address=self.address)
-                resp = await self.master_stub.RegisterWorker(req)
+                resp = await asyncio.wait_for(
+                    self.master_stub.RegisterWorker(req), 
+                    timeout=timeout
+                )
+                
                 if resp.success:
                     logging.info(f"[{self.address}] Successfully registered with master on retry: {resp.message}")
                     return  # Stop retrying after success
                 else:
                     logging.info(f"[{self.address}] Retry registration response: {resp.message}")
+            except asyncio.TimeoutError:
+                logging.warning(f"[{self.address}] Registration request timed out (retry {retry_count})")
             except Exception as e:
                 logging.warning(f"[{self.address}] Retry register failed: {e}")
-            await asyncio.sleep(interval)
+                
+            # Exponential backoff with jitter
+            backoff = interval * (1.5 ** min(retry_count, 8))
+            jitter = random.uniform(0, backoff * 0.3)
+            wait_time = backoff + jitter
+            
+            logging.info(f"[{self.address}] Waiting {wait_time:.2f}s before next registration attempt")
+            await asyncio.sleep(wait_time)
+            retry_count += 1
+        
+        if retry_count >= max_retries:
+            logging.error(f"[{self.address}] Failed to register with master after {retry_count} attempts")
+    async def ensure_socket_available(self, max_attempts=3):
+        """Ensures the socket is available for binding."""
+        if not IS_MACOS:
+            return True  # Only needed on macOS
 
+        host, port = self.address.split(':')
+        port = int(port)
 
+        for attempt in range(max_attempts):
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    if hasattr(socket, 'SO_REUSEPORT'):  # Available on macOS
+                        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+                    s.bind((host, port))
+                    s.close()
+                    return True
+            except OSError:
+                if attempt < max_attempts - 1:
+                    logging.warning(f"Socket {self.address} not available, waiting before retry...")
+                    await asyncio.sleep(2)
+                else:
+                    logging.error(f"Socket {self.address} not available after {max_attempts} attempts")
+                    return False
+        return False
     async def _query_node_for_master(self, node_stub: replication_pb2_grpc.NodeServiceStub, node_address: str) -> Tuple[str, bool, int]:
         """Queries a node for its master status and term."""
         try:

@@ -1,0 +1,34 @@
+syntax = "proto3";
+
+package raft;
+
+// Raft service with only the RPCs needed for election and heartbeats
+service Raft {
+  rpc RequestVote (VoteRequest) returns (VoteResponse);
+  rpc AppendEntries (AppendRequest) returns (AppendResponse);
+}
+
+// Candidate → peers, asking for votes
+message VoteRequest {
+  int32 term = 1;
+  int32 candidateId = 2;
+  int32 lastLogIndex = 3;
+  int32 lastLogTerm = 4;
+}
+
+// Peer → candidate, granting or rejecting vote
+message VoteResponse {
+  int32 term = 1;
+  bool voteGranted = 2;
+}
+
+// Leader → peers, empty AppendEntries used as heartbeat
+message AppendRequest {
+  int32 term = 1;
+  int32 leaderId = 2;
+}
+
+message AppendResponse {
+  int32 term = 1;
+  bool success = 2;
+}

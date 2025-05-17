@@ -28,22 +28,17 @@ muxer_map = {
     'mp4':  'mp4',
     'mkv':  'matroska',
     'webm': 'webm',
-    'mov':  'mov',      # or 'mp4' if your build prefers
+    'mov':  'mov',
 }
 
-os.makedirs(SHARDS_DIR, exist_ok=True)
-os.makedirs(MASTER_DATA_DIR, exist_ok=True)
-os.makedirs(MASTER_RETRIEVED_SHARDS_DIR, exist_ok=True)
-logging.info(f"Ensured shards directory exists at: {os.path.abspath(SHARDS_DIR)}")
-logging.info(f"Ensured master data directory exists at: {os.path.abspath(MASTER_DATA_DIR)}")
-logging.info(f"Ensured master retrieved shards directory exists at: {os.path.abspath(MASTER_RETRIEVED_SHARDS_DIR)}")
+
 
 STREAM_CHUNK_SIZE = 1024 * 1024
 
 MAX_GRPC_MESSAGE_LENGTH = 1024 * 1024 * 1024  # 1gb
 
 class Node:
-    def __init__(self, host: str, port: int, role: str, master_address: Optional[str], known_nodes: List[str]):
+    def __init__(self, host: str, port: int, role: str, master_address: Optional[str], known_nodes: List[str], backup_servers: List[str]):
         self.host = host
         self.port = port
         self.address = f"{host}:{port}"
@@ -57,7 +52,6 @@ class Node:
         self.last_heartbeat_time = time.monotonic()
         self.state = "follower"
 
-        # Store references to background tasks for cancellation
         self._background_tasks: List[asyncio.Task] = []
         self._election_task: Optional[asyncio.Task] = None
         self._pre_election_delay_task: Optional[asyncio.Task] = None
@@ -65,13 +59,12 @@ class Node:
         self._other_nodes_health_check_task: Optional[asyncio.Task] = None
         self._master_health_check_task: Optional[asyncio.Task] = None
 
-        self.node_scores = {}  # Store worker scores when acting as master
-        self.score_last_updated = 0  # When was score last calculated
-        self.score_update_interval = 10  # Seconds between updates
-        self.current_score = None  # Will store the latest score data
+        self.node_scores = {}
+        self.score_last_updated = 0
+        self.score_update_interval = 10
+        self.current_score = None
 
         self.calculate_server_score(force_fresh=True)
-        # Start periodic score update task
         score_update_task = asyncio.create_task(self._update_score_periodically())
         self._background_tasks.append(score_update_task)
 
@@ -93,6 +86,13 @@ class Node:
         self._master_service_added = False
         self._worker_service_added = False
 
+        self.shards_dir = str(self.port) + "-" + SHARDS_DIR
+        if self.role == 'master':
+            os.makedirs(MASTER_DATA_DIR, exist_ok=True)
+            os.makedirs(MASTER_RETRIEVED_SHARDS_DIR, exist_ok=True)
+        logging.info(f"Ensured shards directory exists at: {os.path.abspath(self.shards_dir)}")
+        logging.info(f"Ensured master data directory exists at: {os.path.abspath(MASTER_DATA_DIR)}")
+        logging.info(f"Ensured master retrieved shards directory exists at: {os.path.abspath(MASTER_RETRIEVED_SHARDS_DIR)}")
         self.known_nodes = list(set(known_nodes))
         if self.address in self.known_nodes:
              self.known_nodes.remove(self.address)
@@ -108,15 +108,17 @@ class Node:
         if self.role == 'worker' and self.current_master_address:
             logging.info(f"[{self.address}] Creating/Updating MasterService stubs for {self.current_master_address}")
             self._create_master_stubs(self.current_master_address)
+            os.makedirs(self.shards_dir, exist_ok=True)
 
-            # let master know we exist
             asyncio.create_task(self.retry_register_with_master())
 
+        if self.role == 'master' and backup_servers:
+            self.backup_servers = backup_servers
+            logging.info(f"[{self.address}] Backup servers: {self.backup_servers}")
 
         logging.info(f"[{self.address}] Initialized as {self.role.upper()}. Master is {self.current_master_address}. My ID: {self.id}. Current Term: {self.current_term}")
 
     def _get_or_create_channel(self, node_address: str) -> grpc.aio.Channel:
-        """Gets an existing channel or creates a new one."""
         if node_address not in self._channels or (self._channels.get(node_address) and self._channels[node_address]._channel.closed()):
              logging.info(f"[{self.address}] Creating new channel for {node_address} with max message size {MAX_GRPC_MESSAGE_LENGTH} bytes")
              self._channels[node_address] = grpc.aio.insecure_channel(
@@ -129,38 +131,23 @@ class Node:
         return self._channels[node_address]
 
     def _create_stubs_for_node(self, node_address: str):
-        """Creates stubs with retry logic"""
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                channel = self._get_or_create_channel(node_address)
-                self._node_stubs[node_address] = replication_pb2_grpc.NodeServiceStub(channel)
-                if self.role == 'master':
-                    self._worker_stubs[node_address] = replication_pb2_grpc.WorkerServiceStub(channel)
-                logging.info(f"[{self.address}] Created stubs for {node_address}")
-                break
-            except Exception as e:
-                if attempt == max_retries - 1:
-                    logging.error(f"[{self.address}] Failed to create stubs for {node_address} after {max_retries} attempts")
-                    if node_address in self.known_nodes:
-                        self.known_nodes.remove(node_address)
+        channel = self._get_or_create_channel(node_address)
+        self._node_stubs[node_address] = replication_pb2_grpc.NodeServiceStub(channel)
+        if self.role == 'master':
+            self._worker_stubs[node_address] = replication_pb2_grpc.WorkerServiceStub(channel)
+            logging.info(f"[{self.address}] Created WorkerService stub for {node_address}")
+
 
     def _create_master_stubs(self, master_address: str):
-        """Creates or updates stubs for the master node's services."""
         master_channel_valid = self._master_channel and self._master_channel_address == master_address and not self._master_channel._channel.closed()
 
         if master_channel_valid:
-             logging.debug(f"[{self.address}] Existing master channels to {master_address} are valid.")
              return
 
         if self._master_channel:
-             logging.info(f"[{self.address}] Closing old master MasterService channel to {self._master_channel_address}")
              asyncio.create_task(self._master_channel.close())
              self._master_channel = None
              self._master_channel_address = None
-
-
-        logging.info(f"[{self.address}] Creating new master channels for {master_address} with max message size {MAX_GRPC_MESSAGE_LENGTH} bytes")
 
         self._master_channel = grpc.aio.insecure_channel(
             master_address,
@@ -171,7 +158,6 @@ class Node:
         )
         self._master_channel_address = master_address
         self.master_stub = replication_pb2_grpc.MasterServiceStub(self._master_channel)
-        logging.info(f"[{self.address}] MasterService stub updated for {master_address}")
 
     def _get_or_create_master_stub(self) -> Optional[replication_pb2_grpc.MasterServiceStub]:
         """Returns the MasterService stub for the current master."""
@@ -180,7 +166,7 @@ class Node:
              return None
         self._create_master_stubs(current_master_address)
         return self.master_stub
-    
+
     async def _register_with_master(self):
         try:
             req  = replication_pb2.RegisterWorkerRequest(worker_address=self.address)
@@ -201,8 +187,7 @@ class Node:
         self._server.add_insecure_port(self.address)
         replication_pb2_grpc.add_NodeServiceServicer_to_server(self, self._server)
 
-        # —————————————————————————————————————————————————————————————————
-        # Always register both Master + Worker service implementations
+
         replication_pb2_grpc.MasterServiceServicer.__init__(self)
         replication_pb2_grpc.add_MasterServiceServicer_to_server(self, self._server)
         self._master_service_added = True
@@ -212,16 +197,11 @@ class Node:
         replication_pb2_grpc.add_WorkerServiceServicer_to_server(self, self._server)
         self._worker_service_added = True
         logging.info(f"[{self.address}] WorkerServiceServicer added to server.")
-        # —————————————————————————————————————————————————————————————————
 
-        # Add WorkerService unconditionally if the initial role is worker
+
         if self.role == 'worker':
             score_reporting_task = asyncio.create_task(self._start_score_reporting())
             self._background_tasks.append(score_reporting_task)
-            # replication_pb2_grpc.WorkerServiceServicer.__init__(self)
-            # replication_pb2_grpc.add_WorkerServiceServicer_to_server(self, self._server)
-            # self._worker_service_added = True
-            # logging.info(f"[{self.address}] WorkerServiceServicer added to server.")
 
 
         logging.info(f"[{self.address}] Server starting at {self.address} as {self.role.upper()} with max message size {MAX_GRPC_MESSAGE_LENGTH} bytes")
@@ -232,7 +212,7 @@ class Node:
         discovered_master_address: Optional[str] = None
         highest_term_found = self.current_term
 
-        # Query known nodes for their stats to find potential master
+
         discovery_tasks = []
         for node_addr in self.known_nodes:
              if node_addr != self.address:
@@ -241,7 +221,7 @@ class Node:
                      discovery_tasks.append(asyncio.create_task(self._query_node_for_master(node_stub, node_addr)))
 
         if discovery_tasks:
-             done, pending = await asyncio.wait(discovery_tasks, timeout=5) # Short timeout for startup discovery
+             done, pending = await asyncio.wait(discovery_tasks, timeout=5)
 
              for task in done:
                  try:
@@ -259,7 +239,7 @@ class Node:
         if discovered_master_address and highest_term_found >= self.current_term:
              logging.info(f"[{self.address}] Discovered active master {discovered_master_address} with term {highest_term_found}. Transitioning to follower state.")
              self.state = "follower"
-             self.role = 'worker' # Assume node becomes worker if not the elected master
+             self.role = 'worker'
              self.current_term = highest_term_found
              self.voted_for = None
              self.current_master_address = discovered_master_address
@@ -275,13 +255,13 @@ class Node:
         else:
             logging.info(f"[{self.address}] No active master found with term >= my current term during startup discovery. Proceeding with initial role.")
 
-            # 1) register _both_ gRPC services on every node
+
             replication_pb2_grpc.add_MasterServiceServicer_to_server(self, self._server)
             logging.info(f"[{self.address}] MasterServiceServicer added to server.")
             replication_pb2_grpc.add_WorkerServiceServicer_to_server(self, self._server)
             logging.info(f"[{self.address}] WorkerServiceServicer added to server.")
 
-            # 2) now kick off role‐specific background tasks
+
             if self.role == 'master':
                 logging.info(f"[{self.address}] Initializing worker stubs based on known nodes.")
                 self._worker_stubs = {}
@@ -320,7 +300,7 @@ class Node:
             return node_address, response.is_master, response.current_term
         except (grpc.aio.AioRpcError, asyncio.TimeoutError) as e:
             logging.debug(f"[{self.address}] Node {node_address} unresponsive during startup discovery: {e}")
-            return node_address, False, -1 # Indicate not master and invalid term
+            return node_address, False, -1
         except Exception as e:
             logging.error(f"[{self.address}] Unexpected error during startup discovery check for {node_address}: {type(e).__name__} - {e}", exc_info=True)
             return node_address, False, -1
@@ -330,17 +310,17 @@ class Node:
         """Shuts down the gRPC server and cancels background tasks."""
         logging.info(f"[{self.address}] Initiating graceful shutdown.")
 
-        # Cancel all background tasks
+
         logging.info(f"[{self.address}] Cancelling {len(self._background_tasks)} background tasks.")
         for task in self._background_tasks:
              if not task.done():
                 task.cancel()
 
-        # Wait for background tasks to complete their cancellation
+
         await asyncio.gather(*self._background_tasks, return_exceptions=True)
         logging.info(f"[{self.address}] Background tasks cancellation attempted.")
 
-        # Cancel processing tasks (for workers)
+
         processing_task_list = list(self.processing_tasks.values())
         logging.info(f"[{self.address}] Cancelling {len(processing_task_list)} processing tasks.")
         for task in processing_task_list:
@@ -350,13 +330,13 @@ class Node:
         await asyncio.gather(*processing_task_list, return_exceptions=True)
         logging.info(f"[{self.address}] Processing tasks cancellation attempted.")
 
-        # Shut down the gRPC server
+
         if self._server:
              logging.info(f"[{self.address}] Shutting down gRPC server...")
-             await self._server.stop(5) # Graceful shutdown with a timeout
+             await self._server.stop(5)
              logging.info(f"[{self.address}] gRPC server shut down.")
 
-        # Close all channels
+
         logging.info(f"[{self.address}] Closing gRPC channels.")
         channel_close_tasks = []
         for address, channel in self._channels.items():
@@ -385,15 +365,15 @@ class Node:
              self.state = "follower"
              self.voted_for = None
              self.current_master_address = request.master_address
-             self.leader_address = request.master_address # Assuming master is leader in this model
+             self.leader_address = request.master_address
              self.last_heartbeat_time = time.monotonic()
-             self.role = 'worker' # A non-master receiving higher term becomes worker
+             self.role = 'worker'
 
              logging.info(f"[{self.address}] Updating Master stubs to point to {request.master_address} and attempting to report unreported shards.")
              self._create_master_stubs(request.master_address)
              asyncio.create_task(self._attempt_report_unreported_shards())
 
-             # Cancel any pending election/announcement tasks as we are now a follower
+
              if self._election_task and not self._election_task.done():
                   logging.info(f"[{self.address}] Cancelling pending election task due to new master announcement.")
                   self._election_task.cancel()
@@ -411,7 +391,7 @@ class Node:
                   self._other_nodes_health_check_task.cancel()
                   self._other_nodes_health_check_task = None
 
-             # Ensure master health check is running if we are a worker
+
              if self.role == 'worker' and (self._master_health_check_task is None or self._master_health_check_task.done()):
                   logging.info(f"[{self.address}] Starting master health check routine.")
                   self._master_health_check_task = asyncio.create_task(self.check_master_health())
@@ -451,7 +431,7 @@ class Node:
                       self._election_task.cancel()
                       self._election_task = None
 
-                 # Ensure master health check is running if we are a worker
+
                  if self.role == 'worker' and (self._master_health_check_task is None or self._master_health_check_task.done()):
                       logging.info(f"[{self.address}] Starting master health check routine.")
                       self._master_health_check_task = asyncio.create_task(self.check_master_health())
@@ -470,7 +450,7 @@ class Node:
                  self.state = "follower"
                  self.voted_for = None
                  self.current_master_address = request.master_address
-                 self.leader_address = request.master_address # Assuming master is leader in this model
+                 self.leader_address = request.master_address
                  self.last_heartbeat_time = time.monotonic()
                  self.role = 'worker'
 
@@ -483,7 +463,7 @@ class Node:
                       self._pre_election_delay_task.cancel()
                       self._pre_election_delay_task = None
 
-                 # Ensure master health check is running if we are a worker
+
                  if self.role == 'worker' and (self._master_health_check_task is None or self._master_health_check_task.done()):
                       logging.info(f"[{self.address}] Starting master health check routine.")
                       self._master_health_check_task = asyncio.create_task(self.check_master_health())
@@ -500,12 +480,11 @@ class Node:
         """Handles incoming VoteRequest RPCs with improved tiebreaking."""
         logging.info(f"[{self.address}] Received VoteRequest from {request.candidate_id} with term {request.term} and score {request.score}")
 
-        # If candidate's term is less than current term, reject
+
         if request.term < self.current_term:
             logging.info(f"[{self.address}] Rejecting vote: candidate term {request.term} < our term {self.current_term}")
             return replication_pb2.VoteResponse(term=self.current_term, vote_granted=False, voter_id=self.address)
-            
-        # If candidate's term is greater, update our term and become follower
+
         if request.term > self.current_term:
             logging.info(f"[{self.address}] Candidate has higher term {request.term} > {self.current_term}, updating term")
             self.current_term = request.term
@@ -513,31 +492,28 @@ class Node:
             self.voted_for = None
             self.leader_address = None
             self.current_master_address = None
-            self.last_heartbeat_time = time.monotonic()  # Reset election timeout
-            
-        # Vote if we haven't voted yet in this term or already voted for this candidate
+            self.last_heartbeat_time = time.monotonic()
+
         if (self.voted_for is None or self.voted_for == request.candidate_id) and request.term >= self.current_term:
             vote_granted = False
 
             if not self.score_valid:
-                # If somehow we don't have a valid score, calculate once
                 self.calculate_server_score()
             my_score = self.current_score["score"]
-            # THREE-TIER DECISION LOGIC:
-            # 1. Compare scores - lower is better
+
             if request.score < my_score:
                 vote_granted = True
                 logging.info(f"[{self.address}] Granting vote: candidate score {request.score} < our score {my_score}")
-            # 2. If scores equal, use lexicographical ordering of addresses as tiebreaker
-            elif abs(request.score - my_score) < 0.001:  # Small epsilon for float comparison
-                if request.candidate_id < self.address:  # Deterministic tiebreaker
+
+            elif abs(request.score - my_score) < 0.001:
+                if request.candidate_id < self.address:
                     vote_granted = True
                     logging.info(f"[{self.address}] Granting vote: tied score but candidate ID {request.candidate_id} < our ID {self.address}")
                 else:
                     logging.info(f"[{self.address}] Rejecting vote: tied score but candidate ID {request.candidate_id} >= our ID {self.address}")
             else:
                 logging.info(f"[{self.address}] Rejecting vote: candidate score {request.score} > our score {my_score}")
-            
+
             if vote_granted:
                 self.voted_for = request.candidate_id
                 self.last_heartbeat_time = time.monotonic()
@@ -549,20 +525,19 @@ class Node:
 
     def reset_election_timer(self):
         """Resets election timer with exponential randomized backoff"""
-        base_timeout = 10  # seconds
-        max_timeout = 30   # maximum timeout
-        
-        # Use election attempts to increase backoff with each failed election
+        base_timeout = 10
+        max_timeout = 30
+
         if not hasattr(self, 'election_attempts'):
             self.election_attempts = 1
         else:
             self.election_attempts += 1
-        
-        # Exponential backoff with randomization
-        backoff_factor = min(self.election_attempts, 5)  # Cap at 5 to avoid huge delays
+
+
+        backoff_factor = min(self.election_attempts, 5)
         min_timeout = base_timeout * (1.5 ** backoff_factor)
         max_timeout = min_timeout * 1.5
-        
+
         self.election_timeout = random.uniform(min_timeout, max_timeout)
         logging.info(f"[{self.address}] New election timeout: {self.election_timeout:.2f}s (attempt {self.election_attempts})")
         self.last_heartbeat_time = time.monotonic()
@@ -576,7 +551,7 @@ class Node:
         memory_percent = memory_info.percent
 
         try:
-             shards_disk_usage = shutil.disk_usage(SHARDS_DIR)
+             shards_disk_usage = shutil.disk_usage(self.shards_dir)
              disk_space_free_shards = shards_disk_usage.free
              disk_space_total_shards = shards_disk_usage.total
         except Exception:
@@ -617,34 +592,33 @@ class Node:
             term=self.current_term,
             is_master_known=self.current_master_address is not None
         )
-    
+
     def calculate_server_score(self, force_fresh=False):
         """Calculate a score for this node based on system metrics."""
-        # Return cached score if it's valid and fresh enough
-        if (not force_fresh and self.score_valid and 
+
+        if (not force_fresh and self.score_valid and
                 (time.monotonic() - self.score_last_updated) < self.score_update_interval):
             return self.current_score
 
-        # Get system load average (1, 5, 15 minute averages)
-        try:
-            load_avg = os.getloadavg()[0]  # Use 1-minute average
-        except AttributeError:
-            load_avg = 0  # Default for Windows which doesn't have getloadavg
 
-        # Get current I/O wait percentage
+        try:
+            load_avg = os.getloadavg()[0]
+        except AttributeError:
+            load_avg = 0
+
+
         cpu_times = psutil.cpu_times_percent()
-        io_wait = getattr(cpu_times, "iowait", 0)  # Default to 0 if not available
-        
-        # Get network usage
+        io_wait = getattr(cpu_times, "iowait", 0)
+
         net_io = psutil.net_io_counters()
         net_usage = (net_io.bytes_sent + net_io.bytes_recv) / (1024 * 1024)
-        
-        # Estimate memory stored (size of video shards directory)
+
+
         try:
             memory_stored = sum(
-                os.path.getsize(os.path.join(SHARDS_DIR, f)) 
-                for f in os.listdir(SHARDS_DIR) 
-                if os.path.isfile(os.path.join(SHARDS_DIR, f))
+                os.path.getsize(os.path.join(self.shards_dir , f))
+                for f in os.listdir(self.shards_dir )
+                if os.path.isfile(os.path.join(self.shards_dir , f))
             ) / (1024 * 1024)
         except:
             memory_stored = 0
@@ -666,50 +640,49 @@ class Node:
         }
         self.score_valid = True
         self.score_last_updated = time.monotonic()
-        
+
         return self.current_score
-    
+
     async def ReportResourceScore(self, request: replication_pb2.ReportResourceScoreRequest, context: grpc.aio.ServicerContext) -> replication_pb2.ReportResourceScoreResponse:
         """Handles incoming resource scores from workers."""
         if self.role != 'master':
             logging.info(f"[{self.address}] Received score report but I'm not master. Informing worker.")
             return replication_pb2.ReportResourceScoreResponse(
-                success=False, 
+                success=False,
                 message="Not master"
             )
-        
+
         worker_address = request.worker_address
         score = request.resource_score
-        
+
         logging.info(f"[{self.address}] Received resource score from {worker_address}: {score.score}")
-        
-        # Store score in master's collection
+
+
         if not hasattr(self, 'node_scores'):
             self.node_scores = {}
         self.node_scores[worker_address] = score
-        
+
         return replication_pb2.ReportResourceScoreResponse(success=True)
 
     async def calculate_and_send_score_to_master(self):
-        # Skip if no valid master connection
-        if (not self.current_master_address or 
+        if (not self.current_master_address or
             not self._validate_stub(self.current_master_address)):
             logging.debug(f"[{self.address}] No valid master connection for scoring")
             return
         """Calculate local score and send directly to master."""
-        # Skip score reporting if no master, I am the master, or election is in progress
-        if (not self.current_master_address or 
+
+        if (not self.current_master_address or
             self.current_master_address == self.address or
             self._pre_election_delay_task is not None or
             self.state == "candidate"):
             logging.debug(f"[{self.address}] Skipping score report: No master available, I am the master, or election in progress")
             return
-        
-        # Use stored score (calculate if needed)
+
+
         if not self.score_valid:
             self.calculate_server_score()
-            
-        # Create resource score object
+
+
         resource_score = replication_pb2.ResourceScore(
             server_id=self.current_score["server_id"],
             score=self.current_score["score"],
@@ -718,14 +691,14 @@ class Node:
             net_usage_mb=self.current_score["net_usage_mb"],
             memory_stored_mb=self.current_score["memory_stored_mb"]
         )
-        
-        # Get master stub
+
+
         master_node_stub = self._node_stubs.get(self.current_master_address)
         if not master_node_stub:
             logging.warning(f"[{self.address}] No stub for master at {self.current_master_address}")
             return
-        
-        # Send score directly to master
+
+
         try:
             request = replication_pb2.ReportResourceScoreRequest(
                 worker_address=self.address,
@@ -739,35 +712,35 @@ class Node:
     async def _update_score_periodically(self):
         """Update score periodically in the background."""
         while not getattr(self, '_shutdown_flag', False):
-            # Calculate and store score
+
             self.calculate_server_score(force_fresh=True)
             logging.debug(f"[{self.address}] Updated score: {self.current_score['score']}")
             await asyncio.sleep(self.score_update_interval)
-        
+
     async def _start_score_reporting(self):
         """Periodically report score to master."""
         while self.role == 'worker' and not getattr(self, '_shutdown_flag', False):
-            # Only attempt to report if we're not in an election process
+
             if self._pre_election_delay_task is None and self.current_master_address:
                 await self.calculate_and_send_score_to_master()
-            await asyncio.sleep(10)  # Report every 10 seconds
+            await asyncio.sleep(10)
 
     async def RegisterNode(self, request: replication_pb2.RegisterNodeRequest, context: grpc.aio.ServicerContext) -> replication_pb2.RegisterNodeResponse:
         """Handles registration of new nodes in the network."""
         node_addr = f"{request.address}:{request.port}"
         node_id = request.node_id
-        
+
         logging.info(f"[{self.address}] Received RegisterNode request from {node_id} at {node_addr}")
-        
+
         if node_addr not in self.known_nodes:
             logging.info(f"[{self.address}] Adding new node {node_addr} to known_nodes")
             self.known_nodes.append(node_addr)
             self._create_stubs_for_node(node_addr)
-            
-            # If we're the master, broadcast updated node list to all nodes
+
+
             if self.role == 'master':
                 await self.broadcast_node_list()
-                
+
         return replication_pb2.RegisterNodeResponse(
             success=True,
             current_leader=self.current_master_address or "",
@@ -777,7 +750,7 @@ class Node:
     async def UpdateNodeList(self, request: replication_pb2.UpdateNodeListRequest, context: grpc.aio.ServicerContext) -> replication_pb2.UpdateNodeListResponse:
         """Updates this node's knowledge of the network topology."""
         logging.info(f"[{self.address}] Received UpdateNodeList with {len(request.node_addresses)} nodes")
-        
+
         updated = False
         for node_addr in request.node_addresses:
             if node_addr != self.address and node_addr not in self.known_nodes:
@@ -785,13 +758,13 @@ class Node:
                 self.known_nodes.append(node_addr)
                 self._create_stubs_for_node(node_addr)
                 updated = True
-                
+
         if request.master_address and request.master_address != self.current_master_address:
             logging.info(f"[{self.address}] Updating master address from {self.current_master_address} to {request.master_address}")
             self.current_master_address = request.master_address
             self.leader_address = request.master_address
             updated = True
-            
+
         return replication_pb2.UpdateNodeListResponse(success=True)
 
     async def broadcast_node_list(self):
@@ -799,50 +772,50 @@ class Node:
         if self.role != 'master':
             logging.debug(f"[{self.address}] Not master, skipping node list broadcast")
             return
-            
+
         logging.info(f"[{self.address}] Broadcasting node list to all nodes: {len(self.known_nodes)} nodes")
-        
-        # Include self in the node list if not already there
+
+
         all_nodes = self.known_nodes.copy()
         if self.address not in all_nodes:
             all_nodes.append(self.address)
-            
-        # Create the request
+
+
         request = replication_pb2.UpdateNodeListRequest(
             node_addresses=all_nodes,
             master_address=self.address
         )
-        
-        # Send to all known nodes
-        for node_addr in list(all_nodes):  # Use all_nodes to include self if needed for loops
+
+
+        for node_addr in list(all_nodes):
             if node_addr == self.address:
                 continue
-                
+
             node_stub = self._node_stubs.get(node_addr)
             if not node_stub:
                 logging.warning(f"[{self.address}] No NodeService stub for {node_addr}, cannot update")
                 continue
-                
+
             try:
                 await asyncio.wait_for(node_stub.UpdateNodeList(request), timeout=5)
                 logging.debug(f"[{self.address}] Successfully sent node list to {node_addr}")
             except Exception as e:
                 logging.error(f"[{self.address}] Failed to send node list to {node_addr}: {e}")
-        
+
     async def GetAllNodes(self, request: replication_pb2.GetAllNodesRequest, context: grpc.aio.ServicerContext) -> replication_pb2.GetAllNodesResponse:
         """Returns information about all nodes in the network."""
         logging.info(f"[{self.address}] Received GetAllNodes request")
-        
+
         node_infos = []
         for node_addr in self.known_nodes + [self.address]:
-            # Split address into host and port
+
             if ':' in node_addr:
                 host, port_str = node_addr.rsplit(':', 1)
                 port = int(port_str)
             else:
                 host = node_addr
                 port = 0
-                
+
             node_infos.append(
                 replication_pb2.NodeInfo(
                     node_id=node_addr,
@@ -850,9 +823,9 @@ class Node:
                     port=port
                 )
             )
-            
+
         return replication_pb2.GetAllNodesResponse(nodes=node_infos)
-    
+
     async def RegisterWorker(self, request: replication_pb2.RegisterWorkerRequest, context: grpc.aio.ServicerContext) -> replication_pb2.RegisterWorkerResponse:
         """RPC called by workers at startup to join the cluster."""
         worker_addr = request.worker_address
@@ -860,11 +833,11 @@ class Node:
             logging.info(f"[{self.address}] RegisterWorker: adding {worker_addr}")
             self.known_nodes.append(worker_addr)
             self._create_stubs_for_node(worker_addr)
-            
-            # Broadcast updated node list to all nodes
+
+
             if self.role == 'master':
                 await self.broadcast_node_list()
-                
+
             return replication_pb2.RegisterWorkerResponse(
                 success=True,
                 message=f"{worker_addr} registered"
@@ -877,16 +850,10 @@ class Node:
 
 
     async def UploadVideo(self, request_iterator: AsyncIterator[replication_pb2.UploadVideoChunk], context: grpc.aio.ServicerContext) -> replication_pb2.UploadVideoResponse:
-        """Handles video upload requests (master only)."""
         if self.role != 'master':
              return replication_pb2.UploadVideoResponse(success=False, message="This node is not the master.")
 
-        logging.info(f"[{self.address}] Received UploadVideo stream request.")
-
         video_id: Optional[str] = None
-        target_width: Optional[int] = None
-        target_height: Optional[Optional[int]] = None
-        original_filename: Optional[str] = None
         temp_input_path: Optional[str] = None
 
         try:
@@ -894,105 +861,93 @@ class Node:
             if not first_chunk.is_first_chunk:
                 raise ValueError("First chunk in UploadVideo stream must have is_first_chunk set to True.")
 
-            video_id           = first_chunk.video_id or str(uuid.uuid4())
-            target_width       = first_chunk.target_width
-            target_height      = first_chunk.target_height
-            original_filename  = first_chunk.original_filename or f"{video_id}.mp4"
+            video_id = first_chunk.video_id or str(uuid.uuid4())
+            original_filename = first_chunk.original_filename or f"{video_id}"
+            file_extension = original_filename.split('.')[-1] if '.' in original_filename else 'mp4'
 
-           
-            upscale_width      = first_chunk.upscale_width  or target_width
-            upscale_height     = first_chunk.upscale_height or target_height
-            container          = first_chunk.output_format or 'mp4'
-
-            # Decide container & codec based on requested format
-            vcodec    = 'libx264'     if container in ('mp4','mov','mkv') else 'libvpx-vp9'
-            acodec    = 'aac'         if container in ('mp4','mov','mkv') else 'libvorbis'
-            
-            logging.info(f"[{self.address}] Received metadata for video ID: {video_id}")
-
-            temp_input_path = os.path.join(MASTER_DATA_DIR, f"{video_id}_original.tmp")
-            # Use run_in_executor for blocking file write
+            temp_input_path = os.path.join(MASTER_DATA_DIR, f"{video_id}_original.{file_extension}")
             loop = asyncio.get_event_loop()
             with open(temp_input_path, 'wb') as f:
                 await loop.run_in_executor(None, f.write, first_chunk.data_chunk)
                 async for chunk_message in request_iterator:
-                    if chunk_message.is_first_chunk:
-                         logging.warning(f"[{self.address}] Received unexpected first chunk indicator for video ID: {video_id} in subsequent message.")
                     await loop.run_in_executor(None, f.write, chunk_message.data_chunk)
+
+            # Replicate the original input file to backup servers
+            if hasattr(self, 'backup_servers') and self.backup_servers:
+                logging.info(f"[{self.address}] Replicating original input file for video {video_id} to backup servers")
+                try:
+                    with open(temp_input_path, 'rb') as f:
+                        original_data = f.read()
+                    
+                    for backup_addr in self.backup_servers:
+                        try:
+                            channel = self._get_or_create_channel(backup_addr)
+                            backup_stub = replication_pb2_grpc.NodeServiceStub(channel)
+                            
+                            request = replication_pb2.ReplicateVideoRequest(
+                                video_id=f"{video_id}_original",
+                                video_data=original_data,
+                                container="tmp"  # Using tmp extension for original file
+                            )
+                            
+                            response = await backup_stub.ReplicateVideo(request)
+                            if response.success:
+                                logging.info(f"[{self.address}] Successfully replicated original input file for video {video_id} to backup server {backup_addr}")
+                            else:
+                                logging.error(f"[{self.address}] Failed to replicate original input file for video {video_id} to backup server {backup_addr}: {response.message}")
+                                
+                        except Exception as e:
+                            logging.error(f"[{self.address}] Error replicating original input file to backup server {backup_addr}: {e}")
+                except Exception as e:
+                    logging.error(f"[{self.address}] Error reading original input file for replication: {e}")
 
             logging.info(f"[{self.address}] Finished receiving all chunks for video ID: {video_id}. File saved to {temp_input_path}")
 
             self.video_statuses[video_id] = {
                  "status": "segmenting",
-                 "container": container, 
-                 "target_width": target_width,
-                 "target_height": target_height,
-                 "original_filename": original_filename,
+                 "target_width": first_chunk.target_width,
+                 "target_height": first_chunk.target_height,
+                 "original_extension": file_extension,
                  "shards": {},
                  "retrieved_shards": {},
                  "concatenation_task": None
             }
 
-           
-
-            # Build output pattern (use the container extension)
             output_pattern = os.path.join(
                 MASTER_DATA_DIR,
-                f"{video_id}_shard_%04d.{container}"
+                f"{video_id}_shard_%04d.{file_extension}"
             )
-            segment_time = 10  # or make it another parameter
 
             try:
-                logging.info(
-                    f"[{self.address}] Starting segmentation for video {video_id} from {temp_input_path}"
-                )
-                # FFmpeg is a blocking process, run in executor
                 await loop.run_in_executor(
                     None,
                     lambda: (
                         ffmpeg
                         .input(temp_input_path)
-                        # apply scaling up/down to the requested upscale dimensions
-                        .filter("scale", upscale_width, upscale_height)
-                        # segment muxer
                         .output(
                             output_pattern,
                             format="segment",
-                            segment_time=segment_time,
-                            segment_format_options="fflags=+genpts",
+                            segment_time=10,
                             reset_timestamps=1,
-                            force_key_frames="expr:gte(t,n_forced*10)",
-                            vcodec=vcodec,
-                            acodec=acodec,
-                            **({"video_bitrate": "2M"} if vcodec == "libx264" else {}),
-                            write_prft=1,
+                            c="copy",
+                            acodec="copy",
+                            vcodec="copy"
                         )
-                        .run(
-                            capture_stdout=True,
-                            capture_stderr=True,
-                            overwrite_output=True
-                        )
+                        .run(overwrite_output=True)
                     )
                 )
-                logging.info(f"[{self.address}] Successfully segmented video {video_id}")
                 self.video_statuses[video_id]["status"] = "segmented"
 
-                shard_files = sorted(
-                    glob.glob(
-                        os.path.join(MASTER_DATA_DIR, f"{video_id}_shard_*.{container}")
-                    )
-                )
-                logging.info(f"[{self.address}] Found {len(shard_files)} shards for video {video_id}")
-
-                if not shard_files:
-                    raise Exception("No video segments were created by FFmpeg.")
-
+                shard_files = sorted(glob.glob(os.path.join(MASTER_DATA_DIR, f"{video_id}_shard_*.{file_extension}")))
                 self.video_statuses[video_id]["total_shards"] = len(shard_files)
 
-                # Distribute shards as a background task
                 distribute_task = asyncio.create_task(
                     self._distribute_shards(
-                        video_id, shard_files, target_width, target_height, original_filename
+                        video_id,
+                        shard_files,
+                        first_chunk.target_width,
+                        first_chunk.target_height,
+                        original_filename
                     )
                 )
                 self._background_tasks.append(distribute_task)
@@ -1000,162 +955,140 @@ class Node:
                 return replication_pb2.UploadVideoResponse(
                     video_id=video_id,
                     success=True,
-                    message="Video uploaded and segmentation started."
+                    message="Video uploaded and segmented"
                 )
 
             except ffmpeg.Error as e:
-                 logging.error(f"[{self.address}] FFmpeg segmentation failed for {video_id}: {e.stderr.decode()}", exc_info=True)
                  self.video_statuses[video_id]["status"] = "failed_segmentation"
-                 self.video_statuses[video_id]["message"] = f"FFmpeg segmentation failed: {e.stderr.decode()}"
-                 return replication_pb2.UploadVideoResponse(video_id=video_id, success=False, message=f"FFmpeg segmentation failed: {e.stderr.decode()}")
+                 return replication_pb2.UploadVideoResponse(video_id=video_id, success=False, message=f"Segmentation failed: {e.stderr.decode()}")
             except Exception as e:
-                 logging.error(f"[{self.address}] Segmentation failed for {video_id}: {type(e).__name__} - {e}", exc_info=True)
                  self.video_statuses[video_id]["status"] = "failed_segmentation"
-                 self.video_statuses[video_id]["message"] = f"Segmentation failed: {type(e).__name__} - {e}"
                  return replication_pb2.UploadVideoResponse(video_id=video_id, success=False, message=f"Segmentation failed: {type(e).__name__} - {e}")
 
         except Exception as e:
-             logging.error(f"[{self.address}] Error during UploadVideo stream processing for video ID {video_id}: {type(e).__name__} - {e}", exc_info=True)
              if temp_input_path and os.path.exists(temp_input_path):
-                # Use run_in_executor for blocking file removal
-                loop = asyncio.get_event_loop()
                 await loop.run_in_executor(None, os.remove, temp_input_path)
-                logging.info(f"[{self.address}] Cleaned up partial upload file: {temp_input_path}")
-             if video_id and video_id in self.video_statuses:
-                  self.video_statuses[video_id]["status"] = "upload_failed"
-                  self.video_statuses[video_id]["message"] = f"Upload stream processing failed: {type(e).__name__} - {e}"
-             else:
-                  logging.error(f"[{self.address}] Generic upload stream processing failed before video ID was determined: {type(e).__name__} - {e}", exc_info=True)
-
              return replication_pb2.UploadVideoResponse(
                  video_id=video_id if video_id else "unknown",
                  success=False,
-                 message=f"Upload stream processing failed: {type(e).__name__} - {e}"
+                 message=f"Upload failed: {type(e).__name__} - {e}"
              )
-        # finally:
-        #      # Clean up the temporary original video file AFTER segmentation
-        #      # If segmentation failed, the error handling above already cleans it up.
-        #      # If segmentation succeeded, the shards are distributed, and we can remove the original.
-        #      if temp_input_path and os.path.exists(temp_input_path) and self.video_statuses.get(video_id, {}).get("status") != "segmenting":
-        #          # Only remove if segmentation was attempted or completed.
-        #          # If segmentation failed, it's handled in the segmentation error block.
-        #          # If segmentation succeeded, the shards are distributed, and we can remove the original.
-        #          if self.video_statuses.get(video_id, {}).get("status") in ["segmented", "shards_distributed", "all_shards_processed", "processing_failed", "concatenation_failed", "concatenation_prerequisites_failed", "completed"]:
-        #              # Use run_in_executor for blocking file removal
-        #              loop = asyncio.get_event_loop()
-        #              await loop.run_in_executor(None, os.remove, temp_input_path)
-        #              logging.info(f"[{self.address}] Cleaned up original video file: {temp_input_path}")
-
 
     async def _distribute_shards(self, video_id: str, shard_files: List[str], target_width: int, target_height: int, original_filename: str):
-        """Distributes video shards to available worker nodes."""
-        logging.info(f"[{self.address}] Starting distribution of {len(shard_files)} shards for video {video_id}")
+        """Distributes all shards to workers immediately using parallel tasks"""
+        logging.info(f"[{self.address}] Starting bulk distribution of {len(shard_files)} shards")
 
-        available_worker_addresses = list(self._worker_stubs.keys())
-        if not available_worker_addresses:
-             logging.error(f"[{self.address}] No workers available to process shards for video {video_id}")
-             self.video_statuses[video_id]["status"] = "failed_distribution"
-             self.video_statuses[video_id]["message"] = "No workers available."
-             return
+        max_retries = 5
+        retry_delay = 5
+        valid_workers = []
+        for attempt in range(max_retries):
 
-        total_shards = len(shard_files)
-        shards_to_distribute = list(enumerate(shard_files))
+            valid_workers = [addr for addr in self._worker_stubs if self._worker_stubs.get(addr) is not None]
+            if valid_workers:
+                break
+            logging.warning(f"[{self.address}] No workers available. Retrying in {retry_delay}s (attempt {attempt+1}/{max_retries})")
+            await asyncio.sleep(retry_delay)
+        if not valid_workers:
+            logging.error(f"[{self.address}] Aborting distribution: No workers after {max_retries} retries")
+            return
 
-        failed_to_distribute_in_round = []
-        worker_index = 0
 
-        loop = asyncio.get_event_loop() # Get the event loop for run_in_executor
+        distribution_tasks = []
+        for idx, shard_file in enumerate(shard_files):
+            worker = valid_workers[idx % len(valid_workers)]
+            distribution_tasks.append(
+                self._send_shard_to_worker(
+                    worker=worker,
+                    video_id=video_id,
+                    shard_file=shard_file,
+                    shard_index=idx,
+                    total_shards=len(shard_files),
+                    target_width=target_width,
+                    target_height=target_height,
+                    original_filename=original_filename
+                )
+            )
 
-        while shards_to_distribute and available_worker_addresses:
-             shard_index, shard_file = shards_to_distribute.pop(0)
-             shard_id = os.path.basename(shard_file)
 
-             worker_found = False
-             for i in range(len(available_worker_addresses)):
-                 current_worker_index = (worker_index + i) % len(available_worker_addresses)
-                 worker_address = available_worker_addresses[current_worker_index]
-                 worker_stub = self._worker_stubs.get(worker_address)
+        results = await asyncio.gather(*distribution_tasks, return_exceptions=True)
 
-                 if not worker_stub:
-                    logging.warning(f"[{self.address}] No WorkerService stub for {worker_address}. Removing from available list for this round.")
-                    # Remove the worker from the list if the stub is missing
-                    if worker_address in available_worker_addresses:
-                         available_worker_addresses.remove(worker_address)
-                    continue
+        successful = sum(1 for r in results if r is True)
+        failed = len(shard_files) - successful
 
-                 try:
-                    # Use run_in_executor for blocking file read
-                    shard_data = await loop.run_in_executor(None, self._read_file_blocking, shard_file)
-
-                    request = replication_pb2.DistributeShardRequest(
-                         video_id=video_id,
-                         shard_id=shard_id,
-                         shard_data=shard_data,
-                         shard_index=shard_index,
-                         total_shards=total_shards,
-                         target_width=target_width,
-                         target_height=target_height,
-                         original_filename=original_filename
-                    )
-
-                    logging.info(f"[{self.address}] Sending shard {shard_id} ({len(shard_data)} bytes) to worker {worker_address}")
-                    response = await asyncio.wait_for(worker_stub.ProcessShard(request), timeout=30000)
-
-                    if response.success:
-                         logging.info(f"[{self.address}] Worker {worker_address} accepted shard {shard_id} for processing.")
-                         self.video_statuses[video_id]["shards"][shard_id] = {
-                             "status": "sent_to_worker",
-                             "worker_address": worker_address,
-                             "index": shard_index
-                         }
-                         # Use run_in_executor for blocking file removal
-                         await loop.run_in_executor(None, self._remove_file_blocking, shard_file)
-                         worker_found = True
-                         worker_index = (current_worker_index + 1) % len(available_worker_addresses)
-                         break
-
-                    else:
-                         logging.error(f"[{self.address}] Worker {worker_address} rejected shard {shard_id}: {response.message}. Trying next available worker.")
-
-                 except (grpc.aio.AioRpcError, asyncio.TimeoutError) as e:
-                    logging.error(f"[{self.address}] RPC failed or timed out when sending shard {shard_id} to {worker_address}: {e}. Removing worker from available list for this round and trying next available worker.")
-                    # Remove the worker from the list if RPC fails/times out
-                    if worker_address in available_worker_addresses:
-                         available_worker_addresses.remove(worker_address)
-                         logging.info(f"[{self.address}] Removed worker {worker_address} from available list for this distribution round.")
-
-                 except Exception as e:
-                    logging.error(f"[{self.address}] Failed to send shard {shard_id} to {worker_address}: {type(e).__name__} - {e}. Marking shard as failed distribution.", exc_info=True)
-                    self.video_statuses[video_id]["shards"][shard_id] = {
-                        "status": "failed_distribution",
-                        "worker_address": worker_address,
-                        "message": f"Failed to send: {type(e).__name__} - {e}",
-                        "index": shard_index
-                    }
-                    failed_to_distribute_in_round.append((shard_index, shard_file))
-                    worker_found = True # Consider this shard attempt finished (failed)
-                    # Use run_in_executor for blocking file removal
-                    await loop.run_in_executor(None, self._remove_file_blocking, shard_file)
-                    break
-
-             if not worker_found:
-                 logging.warning(f"[{self.address}] Failed to distribute shard {shard_id} to any available worker in this round. Adding back to the distribution queue.")
-                 shards_to_distribute.append((shard_index, shard_file))
-
-        if not shards_to_distribute and not failed_to_distribute_in_round:
-             self.video_statuses[video_id]["status"] = "shards_distributed"
-             logging.info(f"[{self.address}] Finished attempting to distribute all shards for video {video_id}.")
+        if failed == 0:
+            self._update_video_status(video_id, "distributed", f"All {len(shard_files)} shards distributed")
         else:
-             undistributed_count = len(shards_to_distribute) + len(failed_to_distribute_in_round)
-             self.video_statuses[video_id]["status"] = "partial_distribution_failed"
-             self.video_statuses[video_id]["message"] = f"Failed to distribute {undistributed_count} out of {total_shards} shards."
-             logging.error(f"[{self.address}] Partial distribution failed for video {video_id}. {undistributed_count} shards remain undistributed or failed.")
-             for _, shard_file in shards_to_distribute:
-                 # Use run_in_executor for blocking file removal
-                 await loop.run_in_executor(None, self._remove_file_blocking, shard_file)
-                 logging.info(f"[{self.address}] Cleaned up remaining temporary shard file: {shard_file}")
+            self._update_video_status(video_id, "partial_distribution",
+                                    f"{successful} succeeded, {failed} failed")
 
-    # Helper functions for blocking file operations to be used with run_in_executor
+    async def _send_shard_to_worker(self, worker: str, video_id: str, shard_file: str,
+                                shard_index: int, total_shards: int, target_width: int,
+                                target_height: int, original_filename: str):
+        """Async helper to send a single shard to a worker"""
+        try:
+            worker_stub = self._worker_stubs.get(worker)
+            if not worker_stub:
+                logging.error(f"[{self.address}] Worker stub for {worker} is missing or invalid. Cannot distribute {shard_file}.")
+
+                return False
+
+
+            channel = self._channels.get(worker)
+            if not channel:
+                 logging.error(f"[{self.address}] Channel for worker {worker} not found in _channels. Cannot distribute {shard_file}.")
+
+                 return False
+
+
+            if channel.get_state() == grpc.ChannelConnectivity.SHUTDOWN:
+                logging.error(f"[{self.address}] Channel to worker {worker} is shut down. Cannot distribute {shard_file}.")
+
+                return False
+
+
+            shard_data = await asyncio.get_event_loop().run_in_executor(
+                None, self._read_file_blocking, shard_file
+            )
+
+            request = replication_pb2.DistributeShardRequest(
+                video_id=video_id,
+                shard_id=os.path.basename(shard_file),
+                shard_data=shard_data,
+                shard_index=shard_index,
+                total_shards=total_shards,
+                target_width=target_width,
+                target_height=target_height,
+                original_filename=original_filename
+            )
+
+            logging.info(f"[{self.address}] Attempting to send shard {os.path.basename(shard_file)} to {worker}")
+            await asyncio.wait_for(
+                worker_stub.ProcessShard(request),
+                timeout=30000
+            )
+            logging.info(f"[{self.address}] Successfully sent shard {os.path.basename(shard_file)} to {worker}")
+            
+            if video_id in self.video_statuses:
+                self.video_statuses[video_id]["shards"][os.path.basename(shard_file)] = {
+                    "status": "distributed",
+                    "worker_address": worker,
+                    "index": shard_index
+                }
+            else:
+                logging.error(f"[{self.address}] Video ID {video_id} missing in video_statuses during shard distribution.")
+
+            await asyncio.get_event_loop().run_in_executor(
+                None, self._remove_file_blocking, shard_file
+            )
+            return True
+        except (grpc.aio.AioRpcError, asyncio.TimeoutError) as e:
+            logging.error(f"[{self.address}] RPC failed or timed out when distributing {shard_file} to {worker}: {type(e).__name__} - {e.details() if isinstance(e, grpc.aio.AioRpcError) else e}. Marking shard as failed distribution.", exc_info=True)
+            return False
+        except Exception as e:
+            logging.error(f"[{self.address}] Failed to distribute {shard_file} to {worker}: {type(e).__name__} - {e}. Marking shard as failed distribution.", exc_info=True)
+            return False
+
+
     def _read_file_blocking(self, filepath):
         with open(filepath, 'rb') as f:
             return f.read()
@@ -1200,7 +1133,7 @@ class Node:
             self.video_statuses[video_id]["shards"][shard_id]["worker_address"] = worker_address
 
         if status == "processed_successfully":
-            # Retrieve processed shard as a background task
+
             retrieve_task = asyncio.create_task(self._retrieve_processed_shard(video_id, shard_id, worker_address))
             self._background_tasks.append(retrieve_task)
 
@@ -1213,7 +1146,7 @@ class Node:
 
         worker_stub = self._worker_stubs.get(worker_address)
 
-        
+
         if not worker_stub:
             logging.error(f"[{self.address}] No WorkerService stub for {worker_address}. Cannot retrieve shard {shard_id}. Marking shard as retrieval failed.")
             if shard_id in self.video_statuses[video_id]["shards"]:
@@ -1246,7 +1179,7 @@ class Node:
                     video_info = self.video_statuses[video_id]
                     total_shards = video_info["total_shards"]
                     retrieved_count = len(video_info["retrieved_shards"])
-                    # ✅ If all processed shards retrieved → set status + concat
+
                     if retrieved_count == total_shards:
                         if video_info["concatenation_task"] is None or video_info["concatenation_task"].done():
                             logging.info(f"All {total_shards} shards retrieved. Starting concatenation.")
@@ -1286,9 +1219,8 @@ class Node:
 
         video_info = self.video_statuses[video_id]
         shards = video_info["retrieved_shards"]
-        container = video_info.get("container", "mp4")  # Ensure container is stored during upload
+        container = video_info.get("container", "mp4")
 
-        # Sort shards by index
         sorted_shards = sorted(shards.items(), key=lambda item: item[1]["index"])
 
         tmp_dir = tempfile.mkdtemp(prefix=f"concat_{video_id}_")
@@ -1296,7 +1228,7 @@ class Node:
         output_path = os.path.join(MASTER_DATA_DIR, f"{video_id}_processed.{container}")
 
         try:
-            # Write shard data to temp files and create file list
+
             with open(file_list_path, 'w') as f:
                 for shard_id, shard_data in sorted_shards:
                     shard_filename = os.path.join(tmp_dir, shard_id)
@@ -1304,12 +1236,12 @@ class Node:
                         shard_file.write(shard_data["data"])
                     f.write(f"file '{shard_filename}'\n")
 
-            # Validate all shard files exist
+
             for shard_id, _ in sorted_shards:
                 if not os.path.exists(os.path.join(tmp_dir, shard_id)):
                     raise FileNotFoundError(f"Shard {shard_id} missing in temp dir.")
 
-            # Build FFmpeg command with error handling
+
             ffmpeg_cmd = [
                 "ffmpeg",
                 "-y",
@@ -1332,7 +1264,11 @@ class Node:
             logging.info(f"[{self.address}] Concatenation succeeded: {output_path}")
             video_info["status"] = "completed"
             video_info["processed_video_path"] = output_path
-
+            
+            # Trigger replication to backup servers
+            replicate_task = asyncio.create_task(self._replicate_video_data(video_id, output_path))
+            self._background_tasks.append(replicate_task)
+            
         except subprocess.CalledProcessError as e:
             logging.error(f"[{self.address}] FFmpeg failed (code {e.returncode}): {e.stderr}")
             video_info["status"] = "concatenation_failed"
@@ -1346,7 +1282,6 @@ class Node:
             logging.info(f"[{self.address}] Cleaned up temp dir: {tmp_dir}")
 
 
-    # Helper functions for blocking file operations to be used with run_in_executor
     def _write_file_blocking(self, filepath, data):
         with open(filepath, 'wb') as f:
             f.write(data)
@@ -1379,11 +1314,11 @@ class Node:
              await context.abort(grpc.StatusCode.INTERNAL, "Processed video file not found on master.")
              return
 
-        loop = asyncio.get_event_loop() # Get the event loop for run_in_executor
+        loop = asyncio.get_event_loop()
 
         try:
              logging.info(f"[{self.address}] Streaming processed video file {processed_video_path} for video ID: {video_id}")
-             # Use run_in_executor for blocking file read
+
              with open(processed_video_path, 'rb') as f:
                 while True:
                     chunk = await loop.run_in_executor(None, f.read, STREAM_CHUNK_SIZE)
@@ -1421,132 +1356,119 @@ class Node:
 
         return replication_pb2.VideoStatusResponse(video_id=video_id, status=status, message=message)
 
-    async def ProcessShard(self, request: replication_pb2.DistributeShardRequest, context: grpc.aio.ServicerContext) -> replication_pb2.ProcessShardResponse:
-        logging.info(f"[{self.address}] Received ProcessShard request. Role: {self.role}")
-        if self.role != 'worker':
-            return replication_pb2.ProcessShardResponse(
-                shard_id=request.shard_id,
-                success=False,
-                message="Not a worker"
-            )
+    async def ProcessShard(self, request: replication_pb2.DistributeShardRequest, context: grpc.aio.ServicerContext):
 
-        video_id       = request.video_id
-        shard_id       = request.shard_id       # e.g. "videoid_shard_0000.mkv"
-        shard_data     = request.shard_data
-        target_w       = request.target_width
-        target_h       = request.target_height
-
-        temp_in  = os.path.join(SHARDS_DIR, f"{shard_id}_input.tmp")
-        # Extract container from shard_id extension
-        container = shard_id.split('.')[-1]     # "mkv", "mp4", etc.
-        # Build output path using same extension
-        temp_out = os.path.join(
-            SHARDS_DIR,
-            f"{shard_id}_processed.{container}"
+        asyncio.create_task(self._process_shard_background(request))
+        return replication_pb2.ProcessShardResponse(
+            shard_id=request.shard_id,
+            success=True,
+            message="Shard accepted for processing"
         )
 
-        # Choose codecs
-        vcodec = 'libx264'     if container in ('mp4','mov','mkv') else 'libvpx-vp9'
-        acodec = 'aac'         if container in ('mp4','mov','mkv') else 'libvorbis'
-
-        loop = asyncio.get_event_loop()
+    async def _process_shard_background(self, request):
+        """Actual processing in background with parallel capacity"""
+        process_dir = None
         try:
-            # Write the incoming shard to disk
-            await loop.run_in_executor(None, self._write_file_blocking, temp_in, shard_data)
 
-            logging.info(f"[{self.address}] Processing {shard_id}: {temp_in} → {temp_out} [{container}]")
-            muxer = muxer_map.get(container, container)  # fall back to container itself
+            process_dir = tempfile.mkdtemp(prefix=f"process_{request.shard_id}_")
 
 
-            ff_opts = {
-                'vf':      f'scale={target_w}:{target_h}',
-                'vcodec':  vcodec,
-                'acodec':  acodec,
-                'preset':  'fast',
-                'format':  muxer,    # <- use the muxer name here,
-                'vsync': 'passthrough'  # <-- Add this line
-
-            }
-            logging.info(f"[{self.address}] FFmpeg opts: {ff_opts}")
-
-            # Run FFmpeg in executor
-            await loop.run_in_executor(None, lambda: (
-                ffmpeg
-                .input(temp_in)
-                .output(temp_out, **ff_opts)
-                .run(capture_stdout=True, capture_stderr=True, overwrite_output=True)
-            ))
-            logging.info(f"[{self.address}] Shard {shard_id} processed → {temp_out}")
-
-            # Clean up input temp
-            await loop.run_in_executor(None, os.remove, temp_in)
-
-            # Report success
-            task = asyncio.create_task(
-                self._report_shard_status(video_id, shard_id, "processed_successfully")
-            )
-            self._background_tasks.append(task)
-            return replication_pb2.ProcessShardResponse(
-                shard_id=shard_id,
-                success=True,
-                message="Processed successfully"
+            input_path = os.path.join(process_dir, "input")
+            await asyncio.get_event_loop().run_in_executor(
+                None, self._write_file_blocking, input_path, request.shard_data
             )
 
-        except ffmpeg.Error as e:
-            err = e.stderr.decode()
-            logging.error(f"[{self.address}] FFmpeg failed: {err}")
-            task = asyncio.create_task(
-                self._report_shard_status(video_id, shard_id, "failed_processing", err)
+
+            container = request.shard_id.split(".")[-1] if "." in request.shard_id else "mp4"
+            processed_output_filename = f"{request.shard_id}_processed.{container}"
+            processed_output_temp_path = os.path.join(process_dir, processed_output_filename)
+            processed_output_final_path = os.path.join(self.shards_dir, processed_output_filename)
+
+
+
+            await asyncio.get_event_loop().run_in_executor(
+                None,
+                self._run_ffmpeg_processing,
+                input_path,
+                request.target_width,
+                request.target_height,
+                processed_output_temp_path
             )
-            self._background_tasks.append(task)
-            return replication_pb2.ProcessShardResponse(
-                shard_id=shard_id,
-                success=False,
-                message=f"FFmpeg error: {err}"
+
+
+            await asyncio.get_event_loop().run_in_executor(
+                None, shutil.move, processed_output_temp_path, processed_output_final_path
+            )
+
+
+            await self._report_shard_status(
+                request.video_id,
+                request.shard_id,
+                "processed_successfully",
+                "Processing completed and file saved."
             )
 
         except Exception as e:
-            logging.error(f"[{self.address}] Processing exception: {e}", exc_info=True)
-            task = asyncio.create_task(
-                self._report_shard_status(video_id, shard_id, "failed_processing", str(e))
+            logging.error(f"[{self.address}] Error processing shard {request.shard_id}: {type(e).__name__} - {e}", exc_info=True)
+            await self._report_shard_status(
+                request.video_id,
+                request.shard_id,
+                "failed_processing",
+                f"Processing failed: {type(e).__name__} - {e}"
             )
-            self._background_tasks.append(task)
-        return replication_pb2.ProcessShardResponse(
-            shard_id=shard_id,
-            success=False,
-            message=f"Error: {e}"
+        finally:
+
+            if process_dir and os.path.exists(process_dir):
+                 await asyncio.get_event_loop().run_in_executor(None, shutil.rmtree, process_dir, ignore_errors=True)
+
+
+    def _run_ffmpeg_processing(self, input_path, target_w, target_h, output_path):
+        """Synchronous FFmpeg processing in thread pool"""
+
+        (
+            ffmpeg
+            .input(input_path)
+            .filter('scale', w=target_w, h=target_h)
+            .output(output_path, vcodec='libx264', preset='fast', acodec='copy', loglevel='info')
+            .run(overwrite_output=True, capture_stdout=True, capture_stderr=True)
         )
 
     async def RequestShard(self, request: replication_pb2.RequestShardRequest, context: grpc.aio.ServicerContext) -> replication_pb2.RequestShardResponse:
-        shard_id = request.shard_id  # e.g. “videoid_shard_0002.mkv”
-            # Extract container (extension) from shard_id
-        container = shard_id.split(".")[-1]  # "mkv", "mp4", etc.
+        shard_id = request.shard_id
+        container = shard_id.split(".")[-1] if "." in shard_id else "mp4"
+
         processed_fn = f"{shard_id}_processed.{container}"
-        processed_path = os.path.join(SHARDS_DIR, processed_fn)
+        processed_path = os.path.join(self.shards_dir , processed_fn)
 
         logging.info(f"[{self.address}] RequestShard for {shard_id}, looking at {processed_fn}")
 
         if not os.path.exists(processed_path):
-            msg = "Processed shard file not found."
-            logging.error(f"[{self.address}] {msg} {processed_path}")
+            msg = f"Processed shard file not found. Expected at {processed_path}"
+            logging.error(f"[{self.address}] {msg}")
             return replication_pb2.RequestShardResponse(
                 shard_id=shard_id, success=False, message=msg
             )
 
-        # Read the correctly-named file
-        with open(processed_path, "rb") as f:
-            data = f.read()
 
-        # Optionally clean it up
-        await asyncio.get_event_loop().run_in_executor(None, os.remove, processed_path)
-        logging.info(f"[{self.address}] Cleaned up processed shard file: {processed_fn}")
+        try:
 
-        return replication_pb2.RequestShardResponse(
-            shard_id=shard_id,
-            success=True,
-            shard_data=data, 
-            message="OK"
-        )
+            data = await asyncio.get_event_loop().run_in_executor(None, self._read_file_blocking, processed_path)
+
+
+            return replication_pb2.RequestShardResponse(
+                shard_id=shard_id,
+                success=True,
+                shard_data=data,
+                message="OK"
+            )
+        except Exception as e:
+             msg = f"Failed to read or clean up processed shard file {processed_fn}: {type(e).__name__} - {e}"
+             logging.error(f"[{self.address}] {msg}", exc_info=True)
+             return replication_pb2.RequestShardResponse(
+                shard_id=shard_id, success=False, message=msg
+            )
+
+
 
 
     def _all_shards_processed_successfully(self, video_info):
@@ -1608,32 +1530,30 @@ class Node:
 
         shards_to_report = list(self._unreported_processed_shards.items())
         for (video_id, shard_id), status in shards_to_report:
-            # Call _report_shard_status which will use the current master stub
-            await self._report_shard_status(video_id, shard_id, status)
-            # _report_shard_status will remove the shard from _unreported_processed_shards if successful
 
-    
-    
+            await self._report_shard_status(video_id, shard_id, status)
+
+
     async def _check_other_nodes_health(self):
         """
         Periodically checks every known node:
-        - If we don’t yet have a stub for it, try to create one.
+        - If we don't yet have a stub for it, try to create one.
         - Otherwise, call GetNodeStats() as a lightweight health‐check.
         Works whether master or workers come up in any order.
         """
-        # Only masters run this loop
+
         if self.role != 'master':
             logging.debug(f"[{self.address}] Not master, skipping health checks")
             return
 
-        HEALTH_INTERVAL = 5.0      # seconds between full sweeps
-        JITTER        = 2.0        # up to this much random extra delay
-        TIMEOUT       = 3.0        # seconds per RPC
+        HEALTH_INTERVAL = 5.0
+        JITTER        = 2.0
+        TIMEOUT       = 3.0
 
         logging.info(f"[{self.address}] Starting other‐nodes health check routine")
 
         while True:
-            # bail out if demoted
+
             if self.role != 'master':
                 logging.info(f"[{self.address}] No longer master, stopping health checks")
                 break
@@ -1642,7 +1562,7 @@ class Node:
                 if node_addr == self.address:
                     continue
 
-                # 1) If we never stubbed this node, try to wire it up now
+
                 if node_addr not in self._node_stubs:
                     try:
                         logging.info(f"[{self.address}] Discovered new node {node_addr}, creating stubs")
@@ -1653,7 +1573,7 @@ class Node:
                     # move on whether it succeeded or not
                     continue
 
-                # 2) We have a stub—do a real health check
+
                 stub = self._node_stubs[node_addr]
                 try:
                     await asyncio.wait_for(
@@ -1663,14 +1583,14 @@ class Node:
                     logging.debug(f"[{self.address}] Node {node_addr} is healthy")
                 except (grpc.aio.AioRpcError, asyncio.TimeoutError) as rpc_err:
                     logging.warning(f"[{self.address}] Health check failed for {node_addr}: {rpc_err}")
-                    # Prune this node out of our cluster
+
                     if node_addr in self.known_nodes:
                         logging.info(f"[{self.address}] Removing unreachable node {node_addr} from known_nodes")
                         self.known_nodes.remove(node_addr)
-                    # Tear down its stubs so we stop announcing to it
+
                     self._node_stubs.pop(node_addr, None)
                     self._worker_stubs.pop(node_addr, None)
-                    # *** NEW: also close and drop its channel ***
+
                     if node_addr in self._channels:
                         ch = self._channels.pop(node_addr)
                         try:
@@ -1682,7 +1602,7 @@ class Node:
                 except Exception as exc:
                     logging.error(f"[{self.address}] Unexpected error checking {node_addr}: {exc}", exc_info=True)
 
-            # pause a bit (with jitter) before next sweep
+
             await asyncio.sleep(HEALTH_INTERVAL + random.uniform(0, JITTER))
 
     async def start_election(self):
@@ -1700,39 +1620,39 @@ class Node:
         for node_addr in self.known_nodes:
             if node_addr == self.address:
                 continue
-                
-            # Skip checking nodes we know are unreachable
+
+
             if not self._validate_stub(node_addr):
                 continue
-                
+
             try:
-                # Query node's score
+
                 node_stub = self._node_stubs.get(node_addr)
                 if node_stub:
                     response = await asyncio.wait_for(node_stub.GetNodeStats(replication_pb2.NodeStatsRequest()), timeout=2)
-                    node_score = response.cpu_utilization  # assuming this approximates the score
+                    node_score = response.cpu_utilization
                     if node_score < my_score:
                         better_nodes.append((node_addr, node_score))
             except Exception:
                 continue
-        
-        # If better candidates exist, wait longer before starting election
+
+
         if better_nodes:
             logging.info(f"[{self.address}] Found {len(better_nodes)} better-scoring nodes, delaying election")
-            await asyncio.sleep(random.uniform(8, 12))  # Wait for better nodes to start election
-            
-            # Check if another election is already in progress
+            await asyncio.sleep(random.uniform(8, 12))
+
+
             if self.state != "follower" or self._pre_election_delay_task is not None:
                 logging.info(f"[{self.address}] Election already started by another node, aborting")
                 return
-        
-        # Now proceed with election
+
+
         self.state = "candidate"
         self.current_term += 1
         self.voted_for = self.address
-        self.votes_received = 1  # Vote for self
-        
-        # Record failed master before clearing it
+        self.votes_received = 1
+
+
         failed_master = self.current_master_address
         self.leader_address = None
         self.current_master_address = None
@@ -1746,22 +1666,22 @@ class Node:
             score=score_data["score"]
         )
 
-        # Get list of alive nodes (excluding recently failed master)
-        alive_nodes = [addr for addr in self.known_nodes 
+
+        alive_nodes = [addr for addr in self.known_nodes
                     if addr != failed_master and addr != self.address]
 
-        # Request votes from all known nodes
+
         vote_tasks = []
         for node_addr in alive_nodes:
             if node_addr == failed_master:
                 logging.info(f"[{self.address}] Skipping vote request to known failed node {node_addr}")
                 continue
             if node_addr != self.address:
-                # Skip nodes that we know are down
+
                 if node_addr == self.current_master_address and self.current_master_address is None:
                     logging.info(f"[{self.address}] Skipping vote request to known failed node {node_addr}")
                     continue
-                    
+
                 node_stub = self._node_stubs.get(node_addr)
                 if node_stub:
                     try:
@@ -1778,34 +1698,34 @@ class Node:
             await self._become_master()
             return
 
-        # Wait for vote responses
+
         results = await asyncio.gather(*vote_tasks, return_exceptions=True)
         for result in results:
             if isinstance(result, Exception):
                 logging.error(f"[{self.address}] Exception during vote request: {result}")
                 continue
-                
-            if self.state != "candidate":  # If we're no longer a candidate, stop processing votes
+
+            if self.state != "candidate":
                 return
-                
+
             if result.term > self.current_term:
                 self.current_term = result.term
                 self.state = "follower"
                 self.voted_for = None
                 self.last_heartbeat_time = time.monotonic()
                 return
-                
+
             if result.vote_granted:
                 self.votes_received += 1
                 logging.info(f"[{self.address}] Received vote from {result.voter_id}, total: {self.votes_received}")
 
-        # Check if we have majority
-        total_nodes = len(self.known_nodes) + 1  # +1 for self
+
+        total_nodes = len(self.known_nodes) + 1
         if self.votes_received > total_nodes / 2:
             logging.info(f"[{self.address}] Won election with {self.votes_received} votes out of {total_nodes}")
             await self._become_master()
         else:
-            # Reset to follower state
+
             self.state = "follower"
             if self._master_health_check_task is None or self._master_health_check_task.done():
                 logging.info(f"[{self.address}] Restarting master health check after failed election")
@@ -1817,7 +1737,7 @@ class Node:
         if node_addr not in self._node_stubs:
             return False
         try:
-            # Check channel state
+
             channel = self._node_stubs[node_addr].channel
             return channel.get_state(try_to_connect=True) == grpc.ChannelConnectivity.READY
         except Exception:
@@ -1826,23 +1746,23 @@ class Node:
     def get_best_nodes_by_score(self, count=1):
         """Returns the best nodes based on their scores."""
         if not hasattr(self, 'node_scores') or not self.node_scores:
-            # Fallback to self if no scores available
+
             return [self.address]
-        
-        # Sort nodes by score (lower is better)
-        sorted_nodes = sorted(self.node_scores.keys(), 
+
+
+        sorted_nodes = sorted(self.node_scores.keys(),
                             key=lambda addr: self.node_scores[addr].score)
-        
-        # Return the best 'count' nodes
+
+
         return sorted_nodes[:count]
 
     async def _become_master(self):
         """Transitions the node to the master role."""
         if hasattr(self, 'node_scores') and self.node_scores:
-            # Get the best node by score
+
             best_node = self.get_best_nodes_by_score(1)[0]
-            
-            # If we're not the best, defer to the better node
+
+
             if best_node != self.address and best_node in self.known_nodes:
                 logging.info(f"[{self.address}] Found better master candidate: {best_node}. Deferring leadership.")
                 self.state = "follower"
@@ -1850,8 +1770,8 @@ class Node:
                 self.current_master_address = best_node
                 self.leader_address = best_node
                 self.last_heartbeat_time = time.monotonic()
-                
-                # Create stubs for the new master
+
+
                 self._create_master_stubs(best_node)
                 return
 
@@ -1861,7 +1781,7 @@ class Node:
         self.leader_address = self.address
         self.current_master_address = self.address
 
-        # Add MasterService and WorkerService if not already added
+
         if not self._master_service_added:
             replication_pb2_grpc.MasterServiceServicer.__init__(self)
             replication_pb2_grpc.add_MasterServiceServicer_to_server(self, self._server)
@@ -1874,13 +1794,13 @@ class Node:
             self._worker_service_added = True
             logging.info(f"[{self.address}] WorkerServiceServicer added to server.")
 
-        # Initialize worker stubs
+
         self._worker_stubs = {}
         for node_addr in self.known_nodes:
             if node_addr != self.address:
                 self._create_stubs_for_node(node_addr)
 
-        # Start master routines
+
         if self._master_announcement_task is None or self._master_announcement_task.done():
             self._master_announcement_task = asyncio.create_task(self._master_election_announcement_routine())
             self._background_tasks.append(self._master_announcement_task)
@@ -1904,7 +1824,7 @@ class Node:
     async def _master_election_announcement_routine(self):
         """Periodically announces this node as the master."""
 
-        while self.role == 'master':  # Keep announcing while master
+        while self.role == 'master':
             logging.info(f"[{self.address}] Announcing self as master (Term: {self.current_term}).")
             announcement = replication_pb2.MasterAnnouncement(
                 master_address=self.address,
@@ -1920,16 +1840,16 @@ class Node:
                     await self._send_master_announcement(node_addr, announcement)
                 except (grpc.aio.AioRpcError, asyncio.TimeoutError) as e:
                     logging.warning(f"[{self.address}] MasterAnnouncement to {node_addr} failed: {e}. Removing from cluster.")
-                    # prune it
+
                     self._node_stubs.pop(node_addr, None)
                     self._worker_stubs.pop(node_addr, None)
                     self._channels.pop(node_addr, None)
-                  
+
 
             if announcement_tasks:
                 await asyncio.gather(*announcement_tasks, return_exceptions=True)
 
-            await asyncio.sleep(5)  # Adjust interval as needed
+            await asyncio.sleep(5)
         logging.info(f"[{self.address}] Master announcement routine stopped.")
 
     async def _send_master_announcement(self, node_address: str, announcement: replication_pb2.MasterAnnouncement):
@@ -1946,11 +1866,11 @@ class Node:
             logging.warning(f"[{self.address}] MasterAnnouncement to {node_address} failed: {e}")
         except Exception as e:
             logging.error(f"[{self.address}] Error sending MasterAnnouncement to {node_address}: {e}", exc_info=True)
-            
+
     async def _start_election_with_delay(self):
         """Delays the election start by a randomized timeout."""
         if self._pre_election_delay_task and not self._pre_election_delay_task.done():
-            self._pre_election_delay_task.cancel()  # Cancel any existing delay
+            self._pre_election_delay_task.cancel()
         self.election_timeout = random.uniform(10, 15)
         logging.info(f"[{self.address}] Starting pre-election delay for {self.election_timeout:.2f} seconds.")
         self._pre_election_delay_task = asyncio.create_task(self._election_delay_coro())
@@ -1960,30 +1880,30 @@ class Node:
         """Handles election delay with deadlock prevention"""
         try:
             await asyncio.sleep(self.election_timeout)
-            
-            # Check if another node started election while we were waiting
+
+
             if self.state != "follower" or self.current_master_address:
                 logging.info(f"[{self.address}] Aborting election - cluster state changed during delay")
                 return
-                
-            # Force election resolution after too many attempts
+
+
             if hasattr(self, 'election_attempts') and self.election_attempts > 3:
                 logging.warning(f"[{self.address}] Detected potential election deadlock after {self.election_attempts} attempts")
-                
-                # Force resolution based on node address - deterministic across cluster
+
+
                 for node_addr in sorted(self.known_nodes + [self.address]):
                     if node_addr == self.address:
-                        # We're the lowest node ID that's still alive - become leader
+
                         logging.info(f"[{self.address}] Forcing election resolution - becoming master by ID priority")
                         await self._become_master()
                         return
-                    
-                    # Check if this node with better ID is alive
+
+
                     if self._validate_stub(node_addr):
                         logging.info(f"[{self.address}] Detected alive node {node_addr} with better ID priority")
                         break
-            
-            # Normal election start
+
+
             await self.start_election()
         except asyncio.CancelledError:
             logging.info(f"[{self.address}] Pre-election delay cancelled.")
@@ -1993,15 +1913,15 @@ class Node:
         """Periodically attempts to register with master if not yet successful."""
         while self.role == 'worker':
             try:
-                # Ensure the master stub exists or recreate it if needed
+
                 if not self.master_stub:
                     self._create_master_stubs(self.current_master_address)
-                       # Build and send the registration request to the master
+
                 req = replication_pb2.RegisterWorkerRequest(worker_address=self.address)
                 resp = await self.master_stub.RegisterWorker(req)
                 if resp.success:
                     logging.info(f"[{self.address}] Successfully registered with master on retry: {resp.message}")
-                    return  # Stop retrying after success
+                    return
                 else:
                     logging.info(f"[{self.address}] Retry registration response: {resp.message}")
             except Exception as e:
@@ -2010,40 +1930,42 @@ class Node:
 
     async def check_master_health(self):
         """Periodically checks the health of the master node."""
-        while self.role == 'worker': 
+        while self.role == 'worker':
             if not self.current_master_address:
                 logging.info(f"[{self.address}] No master known, waiting briefly before checking again")
                 await asyncio.sleep(2)
                 continue
+
             try:
-                # Get a NodeServiceStub for the master
+
                 master_node_channel = self._get_or_create_channel(self.current_master_address)
                 if not master_node_channel:
                     logging.warning(f"[{self.address}] Could not get channel to master at {self.current_master_address} for health check.")
-                    self.current_master_address = None  # Clear the master address
-                    await self._start_election_with_delay()  # Start election
-                    continue  # Continue the loop instead of returning
-                    
+                    self.current_master_address = None
+                    await self._start_election_with_delay()
+                    continue
+
+
                 master_node_stub = replication_pb2_grpc.NodeServiceStub(master_node_channel)
 
                 response = await asyncio.wait_for(
                     master_node_stub.GetNodeStats(replication_pb2.NodeStatsRequest()),
                     timeout=5
                 )
-                
-                # Update our knowledge of the network based on master's stats
-                if response.known_nodes_count > len(self.known_nodes) + 1:  # +1 for self
+
+
+                if response.known_nodes_count > len(self.known_nodes) + 1:
                     logging.info(f"[{self.address}] Master knows more nodes than we do. Requesting update.")
                     await self._request_node_list_update(master_node_stub)
-                    
+
                 logging.debug(f"[{self.address}] Master at {self.current_master_address} is healthy.")
-                self.last_heartbeat_time = time.monotonic()  # Update heartbeat
+                self.last_heartbeat_time = time.monotonic()
             except (grpc.aio.AioRpcError, asyncio.TimeoutError) as e:
                 logging.error(f"[{self.address}] Master unreachable: {e}")
                 time_since_last_heartbeat = time.monotonic() - self.last_heartbeat_time
-                
+
                 if time_since_last_heartbeat > self.election_timeout:
-                    # Remove failed master from all tracking
+
                     failed_master = self.current_master_address
                     if failed_master in self.known_nodes:
                         self.known_nodes.remove(failed_master)
@@ -2052,14 +1974,14 @@ class Node:
                     if failed_master in self._channels:
                         await self._channels[failed_master].close()
                         del self._channels[failed_master]
-                    
+
                     self.current_master_address = None
                     logging.info(f"[{self.address}] Init election after master {failed_master} removal")
                     await self._start_election_with_delay()
-                    # break
+
             except Exception as e:
                 logging.error(f"[{self.address}] Error checking master health: {e}", exc_info=True)
-            await asyncio.sleep(2)  # Adjust as needed
+            await asyncio.sleep(2)
         logging.info(f"[{self.address}] Master health check routine stopped.")
 
     async def _request_node_list_update(self, master_node_stub):
@@ -2075,12 +1997,76 @@ class Node:
         except Exception as e:
             logging.error(f"[{self.address}] Failed to get node list from master: {e}")
 
+    async def _replicate_video_data(self, video_id: str, output_path: str):
+        """Replicates video data to backup servers."""
+        if not hasattr(self, 'backup_servers') or not self.backup_servers:
+            logging.warning(f"[{self.address}] No backup servers configured for replication")
+            return
+            
+        logging.info(f"[{self.address}] Starting replication of video {video_id} to backup servers")
+        
+        for backup_addr in self.backup_servers:
+            try:
+                # Get or create channel to backup server
+                channel = self._get_or_create_channel(backup_addr)
+                backup_stub = replication_pb2_grpc.NodeServiceStub(channel)
+                
+                # Read the processed video file
+                with open(output_path, 'rb') as f:
+                    video_data = f.read()
+                    
+                # Create replication request
+                request = replication_pb2.ReplicateVideoRequest(
+                    video_id=video_id,
+                    video_data=video_data,
+                    container=os.path.splitext(output_path)[1][1:]  # Get extension without dot
+                )
+                
+                # Send to backup server
+                response = await backup_stub.ReplicateVideo(request)
+                if response.success:
+                    logging.info(f"[{self.address}] Successfully replicated video {video_id} to backup server {backup_addr}")
+                else:
+                    logging.error(f"[{self.address}] Failed to replicate video {video_id} to backup server {backup_addr}: {response.message}")
+                    
+            except Exception as e:
+                logging.error(f"[{self.address}] Error replicating to backup server {backup_addr}: {e}")
 
-async def serve(host: str, port: int, role: str, master_address: Optional[str], known_nodes: List[str]):
+    async def ReplicateVideo(self, request: replication_pb2.ReplicateVideoRequest, context: grpc.aio.ServicerContext) -> replication_pb2.ReplicateVideoResponse:
+        """Handles video replication requests from master."""
+        try:
+            video_id = request.video_id
+            video_data = request.video_data
+            container = request.container
+            
+            # Create backup directory if it doesn't exist
+            backup_dir = os.path.join(MASTER_DATA_DIR, "backup")
+            os.makedirs(backup_dir, exist_ok=True)
+            
+            # Save the replicated video
+            output_path = os.path.join(backup_dir, f"{video_id}_processed.{container}")
+            with open(output_path, 'wb') as f:
+                f.write(video_data)
+                
+            logging.info(f"[{self.address}] Successfully replicated video {video_id} from master")
+            
+            return replication_pb2.ReplicateVideoResponse(
+                success=True,
+                message="Video replicated successfully"
+            )
+            
+        except Exception as e:
+            logging.error(f"[{self.address}] Failed to replicate video: {e}")
+            return replication_pb2.ReplicateVideoResponse(
+                success=False,
+                message=str(e)
+            )
+
+async def serve(host: str, port: int, role: str, master_address: Optional[str], known_nodes: List[str], backup_servers: List[str]):
     """Starts the gRPC server and initializes the node."""
-    node_instance = Node(host, port, role, master_address, known_nodes)
+    node_instance = Node(host, port, role, master_address, known_nodes, backup_servers)
     await node_instance.start()
-    return node_instance # Return the node instance for shutdown
+    return node_instance
 
 
 if __name__ == '__main__':
@@ -2090,6 +2076,8 @@ if __name__ == '__main__':
     parser.add_argument("--role", type=str, choices=['master', 'worker'], required=True, help="Role of the node (master or worker)")
     parser.add_argument("--master", type=str, help="Address of the initial master node (host:port). Required for workers.")
     parser.add_argument("--nodes", type=str, nargs='*', default=[], help="List of known node addresses (host:port) in the network.")
+    parser.add_argument("--backup-servers", type=str, nargs='*', default=[], 
+                       help="List of backup server addresses (host:port) for data replication")
 
     args = parser.parse_args()
 
@@ -2105,31 +2093,31 @@ if __name__ == '__main__':
             args.nodes.append(args.master)
             args.nodes = list(set(args.nodes))
 
-    node_instance = None # Initialize node_instance to None
+    node_instance = None
     try:
-        # Run the serve coroutine and get the node instance
+
         node_instance = asyncio.run(serve(args.host, args.port,
-                                        args.role, args.master, args.nodes))
+                                        args.role, args.master, args.nodes, args.backup_servers))
     except KeyboardInterrupt:
         print(f"\n[{args.host}:{args.port}] Node interrupted by user.")
     except Exception as e:
         logging.error(f"[{args.host}:{args.port}] Node execution failed: {type(e).__name__} - {e}", exc_info=True)
     finally:
-        # Ensure graceful shutdown is attempted even if an exception occurred
+
         if node_instance:
              logging.info(f"[{args.host}:{args.port}] Attempting graceful shutdown.")
-             # Need a new event loop to run the async stop method if the main loop is closed
+
              try:
                  loop = asyncio.get_running_loop()
              except RuntimeError:
-                 # If no running loop, create a new one
+
                  loop = asyncio.new_event_loop()
                  asyncio.set_event_loop(loop)
 
-             # Run the async stop method in the event loop
+
              loop.run_until_complete(node_instance.stop())
-             # Close the new loop if we created it
-             if loop != asyncio.get_event_loop_policy().get_event_loop(): # Check if it's not the default loop
+
+             if loop != asyncio.get_event_loop_policy().get_event_loop():
                   loop.close()
 
         logging.info(f"[{args.host}:{args.port}] Node process finished.")

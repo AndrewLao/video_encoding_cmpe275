@@ -29,6 +29,8 @@ fi
 echo "Cleaning up temporary directories..."
 find /tmp -maxdepth 1 -type d -name "concat_*" -exec rm -rf {} \;
 echo "Temporary 'concat_*' directories cleaned up."
+rm -rf master_data/
+rm -rf *_shards/
 
 # Optional: Clean up video_shards and master_data directories
 # Use with caution! This will delete all processed shards and original video files.

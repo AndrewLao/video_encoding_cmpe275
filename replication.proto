@@ -60,6 +60,7 @@ service NodeService {
   rpc RegisterNode (RegisterNodeRequest) returns (RegisterNodeResponse);
   rpc UpdateNodeList (UpdateNodeListRequest) returns (UpdateNodeListResponse);
   rpc GetAllNodes (GetAllNodesRequest) returns (GetAllNodesResponse);
+  rpc ReplicateVideo(ReplicateVideoRequest) returns (ReplicateVideoResponse);
 }
 
 // --- Message Definitions ---
@@ -406,4 +407,15 @@ message UpdateNodeListRequest {
 message UpdateNodeListResponse {
   bool success = 1;
   string message = 2;
+}
+
+message ReplicateVideoRequest {
+    string video_id = 1;
+    bytes video_data = 2;
+    string container = 3;
+}
+
+message ReplicateVideoResponse {
+    bool success = 1;
+    string message = 2;
 }

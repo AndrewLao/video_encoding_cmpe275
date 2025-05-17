@@ -43,3 +43,4 @@ master_data/
 
 
 *.mkv
+.python-version

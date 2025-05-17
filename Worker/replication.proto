@@ -407,3 +407,14 @@ message UpdateNodeListResponse {
   bool success = 1;
   string message = 2;
 }
+
+message ReplicateVideoRequest {
+    string video_id = 1;
+    bytes video_data = 2;
+    string container = 3;
+}
+
+message ReplicateVideoResponse {
+    bool success = 1;
+    string message = 2;
+}

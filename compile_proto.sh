@@ -14,7 +14,7 @@ fi
 
 # Compile the protobuf definitions
 echo "Compiling replication.proto..."
-python -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. --pyi_out=. replication.proto
+python3 -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. --pyi_out=. replication.proto
 
 if [ $? -eq 0 ]; then
     echo "Successfully compiled replication.proto"

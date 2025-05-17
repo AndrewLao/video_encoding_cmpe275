@@ -65,6 +65,15 @@ class Node:
         self._other_nodes_health_check_task: Optional[asyncio.Task] = None
         self._master_health_check_task: Optional[asyncio.Task] = None
 
+        self.node_scores = {}  # Store worker scores when acting as master
+        self.score_last_updated = 0  # When was score last calculated
+        self.score_update_interval = 10  # Seconds between updates
+        self.current_score = None  # Will store the latest score data
+
+        self.calculate_server_score(force_fresh=True)
+        # Start periodic score update task
+        score_update_task = asyncio.create_task(self._update_score_periodically())
+        self._background_tasks.append(score_update_task)
 
         self.video_statuses: Dict[str, Dict[str, Any]] = {}
 
@@ -97,8 +106,11 @@ class Node:
                 self._create_stubs_for_node(node_addr)
 
         if self.role == 'worker' and self.current_master_address:
-             logging.info(f"[{self.address}] Creating/Updating MasterService stubs for {self.current_master_address}")
-             self._create_master_stubs(self.current_master_address)
+            logging.info(f"[{self.address}] Creating/Updating MasterService stubs for {self.current_master_address}")
+            self._create_master_stubs(self.current_master_address)
+
+            # let master know we exist
+            asyncio.create_task(self.retry_register_with_master())
 
 
         logging.info(f"[{self.address}] Initialized as {self.role.upper()}. Master is {self.current_master_address}. My ID: {self.id}. Current Term: {self.current_term}")
@@ -117,14 +129,21 @@ class Node:
         return self._channels[node_address]
 
     def _create_stubs_for_node(self, node_address: str):
-        """Creates NodeService and potentially WorkerService stubs."""
-        channel = self._get_or_create_channel(node_address)
-        self._node_stubs[node_address] = replication_pb2_grpc.NodeServiceStub(channel)
-        if self.role == 'master':
-            self._worker_stubs[node_address] = replication_pb2_grpc.WorkerServiceStub(channel)
-            logging.info(f"[{self.address}] Created WorkerService stub for {node_address}")
-        logging.info(f"[{self.address}] Created NodeService stub for {node_address}")
-
+        """Creates stubs with retry logic"""
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                channel = self._get_or_create_channel(node_address)
+                self._node_stubs[node_address] = replication_pb2_grpc.NodeServiceStub(channel)
+                if self.role == 'master':
+                    self._worker_stubs[node_address] = replication_pb2_grpc.WorkerServiceStub(channel)
+                logging.info(f"[{self.address}] Created stubs for {node_address}")
+                break
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    logging.error(f"[{self.address}] Failed to create stubs for {node_address} after {max_retries} attempts")
+                    if node_address in self.known_nodes:
+                        self.known_nodes.remove(node_address)
 
     def _create_master_stubs(self, master_address: str):
         """Creates or updates stubs for the master node's services."""
@@ -154,7 +173,6 @@ class Node:
         self.master_stub = replication_pb2_grpc.MasterServiceStub(self._master_channel)
         logging.info(f"[{self.address}] MasterService stub updated for {master_address}")
 
-
     def _get_or_create_master_stub(self) -> Optional[replication_pb2_grpc.MasterServiceStub]:
         """Returns the MasterService stub for the current master."""
         current_master_address = self.current_master_address
@@ -162,7 +180,14 @@ class Node:
              return None
         self._create_master_stubs(current_master_address)
         return self.master_stub
-
+    
+    async def _register_with_master(self):
+        try:
+            req  = replication_pb2.RegisterWorkerRequest(worker_address=self.address)
+            resp = await self.master_stub.RegisterWorker(req)
+            logging.info(f"[{self.address}] Registered with master: {resp.message}")
+        except Exception as e:
+            logging.error(f"[{self.address}] Failed to register with master: {e}")
 
     async def start(self):
         """Starts the gRPC server and background routines."""
@@ -176,12 +201,27 @@ class Node:
         self._server.add_insecure_port(self.address)
         replication_pb2_grpc.add_NodeServiceServicer_to_server(self, self._server)
 
+        # —————————————————————————————————————————————————————————————————
+        # Always register both Master + Worker service implementations
+        replication_pb2_grpc.MasterServiceServicer.__init__(self)
+        replication_pb2_grpc.add_MasterServiceServicer_to_server(self, self._server)
+        self._master_service_added = True
+        logging.info(f"[{self.address}] MasterServiceServicer added to server.")
+
+        replication_pb2_grpc.WorkerServiceServicer.__init__(self)
+        replication_pb2_grpc.add_WorkerServiceServicer_to_server(self, self._server)
+        self._worker_service_added = True
+        logging.info(f"[{self.address}] WorkerServiceServicer added to server.")
+        # —————————————————————————————————————————————————————————————————
+
         # Add WorkerService unconditionally if the initial role is worker
         if self.role == 'worker':
-             replication_pb2_grpc.WorkerServiceServicer.__init__(self)
-             replication_pb2_grpc.add_WorkerServiceServicer_to_server(self, self._server)
-             self._worker_service_added = True
-             logging.info(f"[{self.address}] WorkerServiceServicer added to server.")
+            score_reporting_task = asyncio.create_task(self._start_score_reporting())
+            self._background_tasks.append(score_reporting_task)
+            # replication_pb2_grpc.WorkerServiceServicer.__init__(self)
+            # replication_pb2_grpc.add_WorkerServiceServicer_to_server(self, self._server)
+            # self._worker_service_added = True
+            # logging.info(f"[{self.address}] WorkerServiceServicer added to server.")
 
 
         logging.info(f"[{self.address}] Server starting at {self.address} as {self.role.upper()} with max message size {MAX_GRPC_MESSAGE_LENGTH} bytes")
@@ -233,45 +273,39 @@ class Node:
 
 
         else:
-             logging.info(f"[{self.address}] No active master found with term >= my current term during startup discovery. Proceeding with initial role.")
-             if self.role == 'master':
-                 replication_pb2_grpc.MasterServiceServicer.__init__(self)
-                 replication_pb2_grpc.add_MasterServiceServicer_to_server(self, self._server)
-                 self._master_service_added = True
-                 logging.info(f"[{self.address}] MasterServiceServicer added to server.")
+            logging.info(f"[{self.address}] No active master found with term >= my current term during startup discovery. Proceeding with initial role.")
 
-                 # Master also needs WorkerService to receive processed shards from workers
-                 if not self._worker_service_added: # Check if already added if started as worker and became master
-                     replication_pb2_grpc.WorkerServiceServicer.__init__(self)
-                     replication_pb2_grpc.add_WorkerServiceServicer_to_server(self, self._server)
-                     self._worker_service_added = True
-                     logging.info(f"[{self.address}] WorkerServiceServicer added to server.")
+            # 1) register _both_ gRPC services on every node
+            replication_pb2_grpc.add_MasterServiceServicer_to_server(self, self._server)
+            logging.info(f"[{self.address}] MasterServiceServicer added to server.")
+            replication_pb2_grpc.add_WorkerServiceServicer_to_server(self, self._server)
+            logging.info(f"[{self.address}] WorkerServiceServicer added to server.")
 
+            # 2) now kick off role‐specific background tasks
+            if self.role == 'master':
+                logging.info(f"[{self.address}] Initializing worker stubs based on known nodes.")
+                self._worker_stubs = {}
+                for node_addr in self.known_nodes:
+                    if node_addr != self.address:
+                        self._create_stubs_for_node(node_addr)
 
-                 logging.info(f"[{self.address}] Initializing worker stubs based on known nodes.")
-                 self._worker_stubs = {}
-                 for node_addr in self.known_nodes:
-                     if node_addr != self.address:
-                         self._create_stubs_for_node(node_addr)
+                logging.info(f"[{self.address}] Starting master announcement routine.")
+                t1 = asyncio.create_task(self._master_election_announcement_routine())
+                self._background_tasks.append(t1)
+                t2 = asyncio.create_task(self._check_other_nodes_health())
+                self._background_tasks.append(t2)
 
-                 logging.info(f"[{self.address}] Starting master announcement routine.")
-                 self._master_announcement_task = asyncio.create_task(self._master_election_announcement_routine())
-                 self._background_tasks.append(self._master_announcement_task)
-                 self._other_nodes_health_check_task = asyncio.create_task(self._check_other_nodes_health())
-                 self._background_tasks.append(self._other_nodes_health_check_task)
+            elif self.role == 'worker':
+                logging.info(f"[{self.address}] Starting worker health check routine.")
+                t = asyncio.create_task(self.check_master_health())
+                self._background_tasks.append(t)
 
+        logging.info(
+            f"[{self.address}] Node is now running with state: {self.state}, "
+            f"role: {self.role}, current_term: {self.current_term}, "
+            f"master: {self.current_master_address}"
+        )
 
-             elif self.role == 'worker':
-                 # WorkerServiceServicer is now added unconditionally above if role is worker.
-                 # Start worker health check routine.
-                 logging.info(f"[{self.address}] Starting worker health check routine.")
-                 self._master_health_check_task = asyncio.create_task(self.check_master_health())
-                 self._background_tasks.append(self._master_health_check_task)
-
-
-        logging.info(f"[{self.address}] Node is now running with state: {self.state}, role: {self.role}, current_term: {self.current_term}, master: {self.current_master_address}")
-
-        # Wait for the server to terminate
         await self._server.wait_for_termination()
 
     async def _query_node_for_master(self, node_stub: replication_pb2_grpc.NodeServiceStub, node_address: str) -> Tuple[str, bool, int]:
@@ -463,68 +497,76 @@ class Node:
         return response
 
     async def RequestVote(self, request: replication_pb2.VoteRequest, context: grpc.aio.ServicerContext) -> replication_pb2.VoteResponse:
-        """Handles incoming VoteRequest RPCs."""
-        logging.info(f"[{self.address}] Received VoteRequest from {context.peer()} (Candidate ID: {request.candidate_id}, Address: {request.candidate_address}, Term: {request.term})")
+        """Handles incoming VoteRequest RPCs with improved tiebreaking."""
+        logging.info(f"[{self.address}] Received VoteRequest from {request.candidate_id} with term {request.term} and score {request.score}")
 
-        vote_granted = False
+        # If candidate's term is less than current term, reject
+        if request.term < self.current_term:
+            logging.info(f"[{self.address}] Rejecting vote: candidate term {request.term} < our term {self.current_term}")
+            return replication_pb2.VoteResponse(term=self.current_term, vote_granted=False, voter_id=self.address)
+            
+        # If candidate's term is greater, update our term and become follower
         if request.term > self.current_term:
-             logging.info(f"[{self.address}] Received VoteRequest with higher term ({request.term} > {self.current_term}). Updating term and voting for {request.candidate_id}.")
-             self.current_term = request.term
-             self.state = "follower"
-             self.voted_for = request.candidate_id
-             vote_granted = True
-             self.last_heartbeat_time = time.monotonic()
-             self.role = 'worker'
+            logging.info(f"[{self.address}] Candidate has higher term {request.term} > {self.current_term}, updating term")
+            self.current_term = request.term
+            self.state = "follower"
+            self.voted_for = None
+            self.leader_address = None
+            self.current_master_address = None
+            self.last_heartbeat_time = time.monotonic()  # Reset election timeout
+            
+        # Vote if we haven't voted yet in this term or already voted for this candidate
+        if (self.voted_for is None or self.voted_for == request.candidate_id) and request.term >= self.current_term:
+            vote_granted = False
 
-             # Cancel any pending election/announcement tasks as we are now a follower
-             if self._election_task and not self._election_task.done():
-                  logging.info(f"[{self.address}] Cancelling pending election task due to granting vote for higher term.")
-                  self._election_task.cancel()
-                  self._election_task = None
-             if self._pre_election_delay_task and not self._pre_election_delay_task.done():
-                  logging.info(f"[{self.address}] Cancelling pending pre-election delay due to granting vote for higher term.")
-                  self._pre_election_delay_task.cancel()
-                  self._pre_election_delay_task = None
-             if self._master_announcement_task and not self._master_announcement_task.done():
-                  logging.info(f"[{self.address}] Cancelling master announcement task.")
-                  self._master_announcement_task.cancel()
-                  self._master_announcement_task = None
-             if self._other_nodes_health_check_task and not self._other_nodes_health_check_task.done():
-                  logging.info(f"[{self.address}] Cancelling other nodes health check task.")
-                  self._other_nodes_health_check_task.cancel()
-                  self._other_nodes_health_check_task = None
-
-             # Ensure master health check is running if we are a worker
-             if self.role == 'worker' and (self._master_health_check_task is None or self._master_health_check_task.done()):
-                  logging.info(f"[{self.address}] Starting master health check routine.")
-                  self._master_health_check_task = asyncio.create_task(self.check_master_health())
-                  self._background_tasks.append(self._master_health_check_task)
-
-
-        elif request.term == self.current_term:
-             if self.voted_for is None or self.voted_for == request.candidate_id:
-                logging.info(f"[{self.address}] Received VoteRequest with equal term ({request.term}). Granting vote to {request.candidate_id}.")
-                self.voted_for = request.candidate_id
+            if not self.score_valid:
+                # If somehow we don't have a valid score, calculate once
+                self.calculate_server_score()
+            my_score = self.current_score["score"]
+            # THREE-TIER DECISION LOGIC:
+            # 1. Compare scores - lower is better
+            if request.score < my_score:
                 vote_granted = True
+                logging.info(f"[{self.address}] Granting vote: candidate score {request.score} < our score {my_score}")
+            # 2. If scores equal, use lexicographical ordering of addresses as tiebreaker
+            elif abs(request.score - my_score) < 0.001:  # Small epsilon for float comparison
+                if request.candidate_id < self.address:  # Deterministic tiebreaker
+                    vote_granted = True
+                    logging.info(f"[{self.address}] Granting vote: tied score but candidate ID {request.candidate_id} < our ID {self.address}")
+                else:
+                    logging.info(f"[{self.address}] Rejecting vote: tied score but candidate ID {request.candidate_id} >= our ID {self.address}")
+            else:
+                logging.info(f"[{self.address}] Rejecting vote: candidate score {request.score} > our score {my_score}")
+            
+            if vote_granted:
+                self.voted_for = request.candidate_id
                 self.last_heartbeat_time = time.monotonic()
-
-                if self._pre_election_delay_task and not self._pre_election_delay_task.done():
-                     logging.info(f"[{self.address}] Cancelling pending pre-election delay due to granting vote for equal term.")
-                     self._pre_election_delay_task.cancel()
-                     self._pre_election_delay_task = None
-
-             else:
-                logging.info(f"[{self.address}] Received VoteRequest with equal term ({request.term}) but already voted for {self.voted_for}. Denying vote to {request.candidate_id}.")
-
         else:
-             logging.info(f"[{self.address}] Received VoteRequest with lower term ({request.term} < {self.current_term}). Denying vote to {request.candidate_id}.")
+            vote_granted = False
+            logging.info(f"[{self.address}] Already voted for {self.voted_for} in term {self.current_term}, rejecting")
 
-        response = replication_pb2.VoteResponse(
-            vote_granted=vote_granted,
-            voter_id=self.id,
-            voter_address=self.address
-        )
-        return response
+        return replication_pb2.VoteResponse(term=self.current_term, vote_granted=vote_granted, voter_id=self.address)
+
+    def reset_election_timer(self):
+        """Resets election timer with exponential randomized backoff"""
+        base_timeout = 10  # seconds
+        max_timeout = 30   # maximum timeout
+        
+        # Use election attempts to increase backoff with each failed election
+        if not hasattr(self, 'election_attempts'):
+            self.election_attempts = 1
+        else:
+            self.election_attempts += 1
+        
+        # Exponential backoff with randomization
+        backoff_factor = min(self.election_attempts, 5)  # Cap at 5 to avoid huge delays
+        min_timeout = base_timeout * (1.5 ** backoff_factor)
+        max_timeout = min_timeout * 1.5
+        
+        self.election_timeout = random.uniform(min_timeout, max_timeout)
+        logging.info(f"[{self.address}] New election timeout: {self.election_timeout:.2f}s (attempt {self.election_attempts})")
+        self.last_heartbeat_time = time.monotonic()
+
 
     async def GetNodeStats(self, request: replication_pb2.NodeStatsRequest, context: grpc.aio.ServicerContext) -> replication_pb2.NodeStatsResponse:
         """Provides statistics about the node."""
@@ -575,6 +617,263 @@ class Node:
             term=self.current_term,
             is_master_known=self.current_master_address is not None
         )
+    
+    def calculate_server_score(self, force_fresh=False):
+        """Calculate a score for this node based on system metrics."""
+        # Return cached score if it's valid and fresh enough
+        if (not force_fresh and self.score_valid and 
+                (time.monotonic() - self.score_last_updated) < self.score_update_interval):
+            return self.current_score
+
+        # Get system load average (1, 5, 15 minute averages)
+        try:
+            load_avg = os.getloadavg()[0]  # Use 1-minute average
+        except AttributeError:
+            load_avg = 0  # Default for Windows which doesn't have getloadavg
+
+        # Get current I/O wait percentage
+        cpu_times = psutil.cpu_times_percent()
+        io_wait = getattr(cpu_times, "iowait", 0)  # Default to 0 if not available
+        
+        # Get network usage
+        net_io = psutil.net_io_counters()
+        net_usage = (net_io.bytes_sent + net_io.bytes_recv) / (1024 * 1024)
+        
+        # Estimate memory stored (size of video shards directory)
+        try:
+            memory_stored = sum(
+                os.path.getsize(os.path.join(SHARDS_DIR, f)) 
+                for f in os.listdir(SHARDS_DIR) 
+                if os.path.isfile(os.path.join(SHARDS_DIR, f))
+            ) / (1024 * 1024)
+        except:
+            memory_stored = 0
+
+        score = (
+            (0.3 * min(100, load_avg * 10))
+            + (0.2 * io_wait)
+            + (0.1 * min(100, net_usage))
+            + (0.4 * min(100, memory_stored))
+        )
+
+        self.current_score = {
+            "server_id": self.address,
+            "score": score,
+            "load_avg": load_avg,
+            "io_wait": io_wait,
+            "net_usage_mb": net_usage,
+            "memory_stored_mb": memory_stored,
+        }
+        self.score_valid = True
+        self.score_last_updated = time.monotonic()
+        
+        return self.current_score
+    
+    async def ReportResourceScore(self, request: replication_pb2.ReportResourceScoreRequest, context: grpc.aio.ServicerContext) -> replication_pb2.ReportResourceScoreResponse:
+        """Handles incoming resource scores from workers."""
+        if self.role != 'master':
+            logging.info(f"[{self.address}] Received score report but I'm not master. Informing worker.")
+            return replication_pb2.ReportResourceScoreResponse(
+                success=False, 
+                message="Not master"
+            )
+        
+        worker_address = request.worker_address
+        score = request.resource_score
+        
+        logging.info(f"[{self.address}] Received resource score from {worker_address}: {score.score}")
+        
+        # Store score in master's collection
+        if not hasattr(self, 'node_scores'):
+            self.node_scores = {}
+        self.node_scores[worker_address] = score
+        
+        return replication_pb2.ReportResourceScoreResponse(success=True)
+
+    async def calculate_and_send_score_to_master(self):
+        # Skip if no valid master connection
+        if (not self.current_master_address or 
+            not self._validate_stub(self.current_master_address)):
+            logging.debug(f"[{self.address}] No valid master connection for scoring")
+            return
+        """Calculate local score and send directly to master."""
+        # Skip score reporting if no master, I am the master, or election is in progress
+        if (not self.current_master_address or 
+            self.current_master_address == self.address or
+            self._pre_election_delay_task is not None or
+            self.state == "candidate"):
+            logging.debug(f"[{self.address}] Skipping score report: No master available, I am the master, or election in progress")
+            return
+        
+        # Use stored score (calculate if needed)
+        if not self.score_valid:
+            self.calculate_server_score()
+            
+        # Create resource score object
+        resource_score = replication_pb2.ResourceScore(
+            server_id=self.current_score["server_id"],
+            score=self.current_score["score"],
+            load_avg=self.current_score["load_avg"],
+            io_wait=self.current_score["io_wait"],
+            net_usage_mb=self.current_score["net_usage_mb"],
+            memory_stored_mb=self.current_score["memory_stored_mb"]
+        )
+        
+        # Get master stub
+        master_node_stub = self._node_stubs.get(self.current_master_address)
+        if not master_node_stub:
+            logging.warning(f"[{self.address}] No stub for master at {self.current_master_address}")
+            return
+        
+        # Send score directly to master
+        try:
+            request = replication_pb2.ReportResourceScoreRequest(
+                worker_address=self.address,
+                resource_score=resource_score
+            )
+            await master_node_stub.ReportResourceScore(request)
+            logging.debug(f"[{self.address}] Successfully reported score to master")
+        except Exception as e:
+            logging.error(f"[{self.address}] Failed to report score to master: {e}")
+
+    async def _update_score_periodically(self):
+        """Update score periodically in the background."""
+        while not getattr(self, '_shutdown_flag', False):
+            # Calculate and store score
+            self.calculate_server_score(force_fresh=True)
+            logging.debug(f"[{self.address}] Updated score: {self.current_score['score']}")
+            await asyncio.sleep(self.score_update_interval)
+        
+    async def _start_score_reporting(self):
+        """Periodically report score to master."""
+        while self.role == 'worker' and not getattr(self, '_shutdown_flag', False):
+            # Only attempt to report if we're not in an election process
+            if self._pre_election_delay_task is None and self.current_master_address:
+                await self.calculate_and_send_score_to_master()
+            await asyncio.sleep(10)  # Report every 10 seconds
+
+    async def RegisterNode(self, request: replication_pb2.RegisterNodeRequest, context: grpc.aio.ServicerContext) -> replication_pb2.RegisterNodeResponse:
+        """Handles registration of new nodes in the network."""
+        node_addr = f"{request.address}:{request.port}"
+        node_id = request.node_id
+        
+        logging.info(f"[{self.address}] Received RegisterNode request from {node_id} at {node_addr}")
+        
+        if node_addr not in self.known_nodes:
+            logging.info(f"[{self.address}] Adding new node {node_addr} to known_nodes")
+            self.known_nodes.append(node_addr)
+            self._create_stubs_for_node(node_addr)
+            
+            # If we're the master, broadcast updated node list to all nodes
+            if self.role == 'master':
+                await self.broadcast_node_list()
+                
+        return replication_pb2.RegisterNodeResponse(
+            success=True,
+            current_leader=self.current_master_address or "",
+            nodes=self.known_nodes
+        )
+
+    async def UpdateNodeList(self, request: replication_pb2.UpdateNodeListRequest, context: grpc.aio.ServicerContext) -> replication_pb2.UpdateNodeListResponse:
+        """Updates this node's knowledge of the network topology."""
+        logging.info(f"[{self.address}] Received UpdateNodeList with {len(request.node_addresses)} nodes")
+        
+        updated = False
+        for node_addr in request.node_addresses:
+            if node_addr != self.address and node_addr not in self.known_nodes:
+                logging.info(f"[{self.address}] Adding new node {node_addr} to known_nodes")
+                self.known_nodes.append(node_addr)
+                self._create_stubs_for_node(node_addr)
+                updated = True
+                
+        if request.master_address and request.master_address != self.current_master_address:
+            logging.info(f"[{self.address}] Updating master address from {self.current_master_address} to {request.master_address}")
+            self.current_master_address = request.master_address
+            self.leader_address = request.master_address
+            updated = True
+            
+        return replication_pb2.UpdateNodeListResponse(success=True)
+
+    async def broadcast_node_list(self):
+        """Broadcasts the complete node list to all known nodes."""
+        if self.role != 'master':
+            logging.debug(f"[{self.address}] Not master, skipping node list broadcast")
+            return
+            
+        logging.info(f"[{self.address}] Broadcasting node list to all nodes: {len(self.known_nodes)} nodes")
+        
+        # Include self in the node list if not already there
+        all_nodes = self.known_nodes.copy()
+        if self.address not in all_nodes:
+            all_nodes.append(self.address)
+            
+        # Create the request
+        request = replication_pb2.UpdateNodeListRequest(
+            node_addresses=all_nodes,
+            master_address=self.address
+        )
+        
+        # Send to all known nodes
+        for node_addr in list(all_nodes):  # Use all_nodes to include self if needed for loops
+            if node_addr == self.address:
+                continue
+                
+            node_stub = self._node_stubs.get(node_addr)
+            if not node_stub:
+                logging.warning(f"[{self.address}] No NodeService stub for {node_addr}, cannot update")
+                continue
+                
+            try:
+                await asyncio.wait_for(node_stub.UpdateNodeList(request), timeout=5)
+                logging.debug(f"[{self.address}] Successfully sent node list to {node_addr}")
+            except Exception as e:
+                logging.error(f"[{self.address}] Failed to send node list to {node_addr}: {e}")
+        
+    async def GetAllNodes(self, request: replication_pb2.GetAllNodesRequest, context: grpc.aio.ServicerContext) -> replication_pb2.GetAllNodesResponse:
+        """Returns information about all nodes in the network."""
+        logging.info(f"[{self.address}] Received GetAllNodes request")
+        
+        node_infos = []
+        for node_addr in self.known_nodes + [self.address]:
+            # Split address into host and port
+            if ':' in node_addr:
+                host, port_str = node_addr.rsplit(':', 1)
+                port = int(port_str)
+            else:
+                host = node_addr
+                port = 0
+                
+            node_infos.append(
+                replication_pb2.NodeInfo(
+                    node_id=node_addr,
+                    address=host,
+                    port=port
+                )
+            )
+            
+        return replication_pb2.GetAllNodesResponse(nodes=node_infos)
+    
+    async def RegisterWorker(self, request: replication_pb2.RegisterWorkerRequest, context: grpc.aio.ServicerContext) -> replication_pb2.RegisterWorkerResponse:
+        """RPC called by workers at startup to join the cluster."""
+        worker_addr = request.worker_address
+        if worker_addr not in self.known_nodes:
+            logging.info(f"[{self.address}] RegisterWorker: adding {worker_addr}")
+            self.known_nodes.append(worker_addr)
+            self._create_stubs_for_node(worker_addr)
+            
+            # Broadcast updated node list to all nodes
+            if self.role == 'master':
+                await self.broadcast_node_list()
+                
+            return replication_pb2.RegisterWorkerResponse(
+                success=True,
+                message=f"{worker_addr} registered"
+            )
+        else:
+            return replication_pb2.RegisterWorkerResponse(
+                success=False,
+                message=f"{worker_addr} was already registered"
+            )
 
 
     async def UploadVideo(self, request_iterator: AsyncIterator[replication_pb2.UploadVideoChunk], context: grpc.aio.ServicerContext) -> replication_pb2.UploadVideoResponse:
@@ -1308,7 +1607,6 @@ class Node:
         logging.info(f"[{self.address}] Attempting to report {len(self._unreported_processed_shards)} unreported processed shards to the new master {self.current_master_address}.")
 
         shards_to_report = list(self._unreported_processed_shards.items())
-
         for (video_id, shard_id), status in shards_to_report:
             # Call _report_shard_status which will use the current master stub
             await self._report_shard_status(video_id, shard_id, status)
@@ -1317,121 +1615,245 @@ class Node:
     
     
     async def _check_other_nodes_health(self):
-        """Periodically checks the health of other known nodes (master only)."""
-        # This task is added to _background_tasks when the role is master initially or becomes master
+        """
+        Periodically checks every known node:
+        - If we don’t yet have a stub for it, try to create one.
+        - Otherwise, call GetNodeStats() as a lightweight health‐check.
+        Works whether master or workers come up in any order.
+        """
+        # Only masters run this loop
         if self.role != 'master':
-             logging.debug(f"[{self.address}] Not a master ({self.role}), skipping other nodes health check routine.")
-             return
-
-        health_check_interval = 5
-        jitter_range = 2
-
-        logging.info(f"[{self.address}] Starting other nodes health check routine.")
-
-        while True:
-             # Check if the role has changed while in the loop
-             if self.role != 'master':
-                 logging.info(f"[{self.address}] Role changed to {self.role}, stopping other nodes health check routine.")
-                 break
-
-             await asyncio.sleep(health_check_interval + random.uniform(0, jitter_range))
-
-             # Iterate through a copy of known_nodes as the list might change if nodes are added/removed
-             for node_addr in list(self.known_nodes):
-                 if node_addr == self.address:
-                     continue
-
-                 node_stub = self._node_stubs.get(node_addr)
-                 if not node_stub:
-                    logging.warning(f"[{self.address}] No NodeService stub available for {node_addr}. Cannot perform health check.")
-                    continue
-
-                 try:
-                    # Attempt to get stats as a health check
-                    await asyncio.wait_for(
-                        node_stub.GetNodeStats(replication_pb2.NodeStatsRequest()),
-                        timeout=3 # seconds
-                    )
-                    logging.debug(f"[{self.address}] Node {node_addr} health check successful.")
-
-                 except (grpc.aio.AioRpcError, asyncio.TimeoutError) as e:
-                    logging.warning(f"[{self.address}] Node {node_addr} health check failed: {e}. Node is potentially down.")
-
-                 except Exception as e:
-                    logging.error(f"[{self.address}] Unexpected error during health check for {node_addr}: {type(e).__name__} - {e}", exc_info=True)
-
-
-
-    async def _delayed_start_election(self, delay: float):
-        """Waits for a random delay before starting an election."""
-        try:
-            logging.info(f"[{self.address}] Starting {delay:.2f}s pre-election delay.")
-            await asyncio.sleep(delay)
-            logging.info(f"[{self.address}] Pre-election delay finished. Proceeding to start election.")
-            # Only start election if still in follower or candidate state after the delay
-            if self.state in ["follower", "candidate"]:
-                # Create the election task and store it
-                self._election_task = asyncio.create_task(self.start_election())
-                # Add to background tasks for cancellation
-                self._background_tasks.append(self._election_task)
-            else:
-                logging.info(f"[{self.address}] No longer in follower/candidate state after delay ({self.state}). Skipping election start.")
-
-        except asyncio.CancelledError:
-            logging.info(f"[{self.address}] Pre-election delay task cancelled.")
-        except Exception as e:
-            logging.error(f"[{self.address}] Error during pre-election delay: {type(e).__name__} - {e}", exc_info=True)
-        finally:
-             # Ensure the task reference is cleared after it's done (cancelled or finished)
-             self._pre_election_delay_task = None
-
-
-    async def _start_election(self):
-        """Starts a new election."""
-
-        if self.state == "leader":
-            logging.warning(f"[{self.address}] Attempted to start election while already leader. This is unexpected.")
+            logging.debug(f"[{self.address}] Not master, skipping health checks")
             return
 
-        logging.info(f"[{self.address}] Starting election (Term: {self.current_term + 1}).")
-        self.current_term += 1
-        self.state = "candidate"
-        self.voted_for = self.address  # Vote for self
-        votes_received = 1  # Start with one vote (self)
+        HEALTH_INTERVAL = 5.0      # seconds between full sweeps
+        JITTER        = 2.0        # up to this much random extra delay
+        TIMEOUT       = 3.0        # seconds per RPC
 
-        vote_requests = []
-        for node_addr in self._node_stubs:
-            if node_addr != self.address:
+        logging.info(f"[{self.address}] Starting other‐nodes health check routine")
+
+        while True:
+            # bail out if demoted
+            if self.role != 'master':
+                logging.info(f"[{self.address}] No longer master, stopping health checks")
+                break
+
+            for node_addr in list(self.known_nodes):
+                if node_addr == self.address:
+                    continue
+
+                # 1) If we never stubbed this node, try to wire it up now
+                if node_addr not in self._node_stubs:
+                    try:
+                        logging.info(f"[{self.address}] Discovered new node {node_addr}, creating stubs")
+                        self._create_stubs_for_node(node_addr)
+                        logging.info(f"[{self.address}] Stubs successfully created for {node_addr}")
+                    except Exception as e:
+                        logging.debug(f"[{self.address}] Still can’t reach {node_addr}: {e}")
+                    # move on whether it succeeded or not
+                    continue
+
+                # 2) We have a stub—do a real health check
                 stub = self._node_stubs[node_addr]
-                vote_requests.append(self._send_request_vote(stub, node_addr))
+                try:
+                    await asyncio.wait_for(
+                        stub.GetNodeStats(replication_pb2.NodeStatsRequest()),
+                        timeout=TIMEOUT
+                    )
+                    logging.debug(f"[{self.address}] Node {node_addr} is healthy")
+                except (grpc.aio.AioRpcError, asyncio.TimeoutError) as rpc_err:
+                    logging.warning(f"[{self.address}] Health check failed for {node_addr}: {rpc_err}")
+                    # Prune this node out of our cluster
+                    if node_addr in self.known_nodes:
+                        logging.info(f"[{self.address}] Removing unreachable node {node_addr} from known_nodes")
+                        self.known_nodes.remove(node_addr)
+                    # Tear down its stubs so we stop announcing to it
+                    self._node_stubs.pop(node_addr, None)
+                    self._worker_stubs.pop(node_addr, None)
+                    # *** NEW: also close and drop its channel ***
+                    if node_addr in self._channels:
+                        ch = self._channels.pop(node_addr)
+                        try:
+                            asyncio.create_task(ch.close())
+                            logging.info(f"[{self.address}] Closed channel to {node_addr}")
+                        except Exception:
+                            pass
 
-        if vote_requests:
-            vote_results = await asyncio.gather(*vote_requests, return_exceptions=True)
+                except Exception as exc:
+                    logging.error(f"[{self.address}] Unexpected error checking {node_addr}: {exc}", exc_info=True)
 
-            for result in vote_results:
-                if isinstance(result, replication_pb2.VoteResponse) and result.vote_granted:
-                    votes_received += 1
-                elif isinstance(result, Exception):
-                    logging.error(f"[{self.address}] Error during VoteRequest: {result}")
+            # pause a bit (with jitter) before next sweep
+            await asyncio.sleep(HEALTH_INTERVAL + random.uniform(0, JITTER))
 
-        total_nodes = len(self.known_nodes) + 1  # Plus self
-        majority = total_nodes // 2 + 1
+    async def start_election(self):
+        """Initiates leader election with improved coordination"""
+        if self.state == "leader":
+            return
+        
+        # Calculate our score
+        score_data = self.calculate_server_score()
+        my_score = score_data["score"]
+        # Before becoming a candidate, verify if we should run at all
+        
+        # Check if there are better-scoring nodes that should be leaders instead
+        better_nodes = []
+        for node_addr in self.known_nodes:
+            if node_addr == self.address:
+                continue
+                
+            # Skip checking nodes we know are unreachable
+            if not self._validate_stub(node_addr):
+                continue
+                
+            try:
+                # Query node's score
+                node_stub = self._node_stubs.get(node_addr)
+                if node_stub:
+                    response = await asyncio.wait_for(node_stub.GetNodeStats(replication_pb2.NodeStatsRequest()), timeout=2)
+                    node_score = response.cpu_utilization  # assuming this approximates the score
+                    if node_score < my_score:
+                        better_nodes.append((node_addr, node_score))
+            except Exception:
+                continue
+        
+        # If better candidates exist, wait longer before starting election
+        if better_nodes:
+            logging.info(f"[{self.address}] Found {len(better_nodes)} better-scoring nodes, delaying election")
+            await asyncio.sleep(random.uniform(8, 12))  # Wait for better nodes to start election
+            
+            # Check if another election is already in progress
+            if self.state != "follower" or self._pre_election_delay_task is not None:
+                logging.info(f"[{self.address}] Election already started by another node, aborting")
+                return
+        
+        # Now proceed with election
+        self.state = "candidate"
+        self.current_term += 1
+        self.voted_for = self.address
+        self.votes_received = 1  # Vote for self
+        
+        # Record failed master before clearing it
+        failed_master = self.current_master_address
+        self.leader_address = None
+        self.current_master_address = None
 
-        logging.info(f"[{self.address}] Received {votes_received} votes out of {total_nodes} for term {self.current_term}")
+        logging.info(f"[{self.address}] Starting election for term {self.current_term}")
 
-        if self.state == "candidate" and votes_received >= majority:
-            logging.info(f"[{self.address}] Won election for term {self.current_term}. Becoming master.")
+        # Create vote request with score
+        request = replication_pb2.VoteRequest(
+            term=self.current_term,
+            candidate_id=self.address,
+            score=score_data["score"]
+        )
+
+        # Get list of alive nodes (excluding recently failed master)
+        alive_nodes = [addr for addr in self.known_nodes 
+                    if addr != failed_master and addr != self.address]
+
+        # Request votes from all known nodes
+        vote_tasks = []
+        for node_addr in alive_nodes:
+            if node_addr == failed_master:
+                logging.info(f"[{self.address}] Skipping vote request to known failed node {node_addr}")
+                continue
+            if node_addr != self.address:
+                # Skip nodes that we know are down
+                if node_addr == self.current_master_address and self.current_master_address is None:
+                    logging.info(f"[{self.address}] Skipping vote request to known failed node {node_addr}")
+                    continue
+                    
+                node_stub = self._node_stubs.get(node_addr)
+                if node_stub:
+                    try:
+                        logging.info(f"[{self.address}] Sending vote request to {node_addr}")
+                        task = asyncio.create_task(
+                            self._send_request_vote(node_stub, request, node_addr)
+                        )
+                        vote_tasks.append(task)
+                    except Exception as e:
+                        logging.error(f"[{self.address}] Error creating vote request for {node_addr}: {e}")
+
+        if not vote_tasks:
+            logging.info(f"[{self.address}] No other nodes to request votes from, becoming leader")
             await self._become_master()
-        elif self.state == "candidate":
-            logging.info(f"[{self.address}] Lost election for term {self.current_term}.")
+            return
+
+        # Wait for vote responses
+        results = await asyncio.gather(*vote_tasks, return_exceptions=True)
+        for result in results:
+            if isinstance(result, Exception):
+                logging.error(f"[{self.address}] Exception during vote request: {result}")
+                continue
+                
+            if self.state != "candidate":  # If we're no longer a candidate, stop processing votes
+                return
+                
+            if result.term > self.current_term:
+                self.current_term = result.term
+                self.state = "follower"
+                self.voted_for = None
+                self.last_heartbeat_time = time.monotonic()
+                return
+                
+            if result.vote_granted:
+                self.votes_received += 1
+                logging.info(f"[{self.address}] Received vote from {result.voter_id}, total: {self.votes_received}")
+
+        # Check if we have majority
+        total_nodes = len(self.known_nodes) + 1  # +1 for self
+        if self.votes_received > total_nodes / 2:
+            logging.info(f"[{self.address}] Won election with {self.votes_received} votes out of {total_nodes}")
+            await self._become_master()
+        else:
+            # Reset to follower state
             self.state = "follower"
-            self.voted_for = None
-            #  Election failed, reset master address
-            self.current_master_address = None
-            self.leader_address = None
+            if self._master_health_check_task is None or self._master_health_check_task.done():
+                logging.info(f"[{self.address}] Restarting master health check after failed election")
+                self._master_health_check_task = asyncio.create_task(self.check_master_health())
+                self._background_tasks.append(self._master_health_check_task)
+
+    def _validate_stub(self, node_addr: str) -> bool:
+        """Returns True if stub is valid and connected"""
+        if node_addr not in self._node_stubs:
+            return False
+        try:
+            # Check channel state
+            channel = self._node_stubs[node_addr].channel
+            return channel.get_state(try_to_connect=True) == grpc.ChannelConnectivity.READY
+        except Exception:
+            return False
+
+    def get_best_nodes_by_score(self, count=1):
+        """Returns the best nodes based on their scores."""
+        if not hasattr(self, 'node_scores') or not self.node_scores:
+            # Fallback to self if no scores available
+            return [self.address]
+        
+        # Sort nodes by score (lower is better)
+        sorted_nodes = sorted(self.node_scores.keys(), 
+                            key=lambda addr: self.node_scores[addr].score)
+        
+        # Return the best 'count' nodes
+        return sorted_nodes[:count]
 
     async def _become_master(self):
         """Transitions the node to the master role."""
+        if hasattr(self, 'node_scores') and self.node_scores:
+            # Get the best node by score
+            best_node = self.get_best_nodes_by_score(1)[0]
+            
+            # If we're not the best, defer to the better node
+            if best_node != self.address and best_node in self.known_nodes:
+                logging.info(f"[{self.address}] Found better master candidate: {best_node}. Deferring leadership.")
+                self.state = "follower"
+                self.role = 'worker'
+                self.current_master_address = best_node
+                self.leader_address = best_node
+                self.last_heartbeat_time = time.monotonic()
+                
+                # Create stubs for the new master
+                self._create_master_stubs(best_node)
+                return
 
         logging.info(f"[{self.address}] Becoming master for term {self.current_term}.")
         self.role = 'master'
@@ -1466,17 +1888,11 @@ class Node:
             self._other_nodes_health_check_task = asyncio.create_task(self._check_other_nodes_health())
             self._background_tasks.append(self._other_nodes_health_check_task)
 
-    async def _send_request_vote(self, stub: replication_pb2_grpc.NodeServiceStub, node_address: str) -> Optional[replication_pb2.VoteResponse]:
+    async def _send_request_vote(self, node_stub: replication_pb2_grpc.NodeServiceStub, request: replication_pb2.VoteRequest, node_address: str) -> replication_pb2.VoteResponse:
         """Sends a RequestVote RPC to a node."""
-
         try:
-            request = replication_pb2.VoteRequest(
-                candidate_id=self.address,
-                candidate_address=self.address,
-                term=self.current_term
-            )
-            response = await asyncio.wait_for(stub.RequestVote(request), timeout=5)
-            logging.debug(f"[{self.address}] Received VoteResponse from {node_address}: {response.vote_granted}")
+            response = await asyncio.wait_for(node_stub.RequestVote(request), timeout=5)
+            logging.info(f"[{self.address}] Received VoteResponse from {node_address}: {response.vote_granted}")
             return response
         except (grpc.aio.AioRpcError, asyncio.TimeoutError) as e:
             logging.warning(f"[{self.address}] VoteRequest to {node_address} failed: {e}")
@@ -1484,55 +1900,6 @@ class Node:
         except Exception as e:
             logging.error(f"[{self.address}] Unexpected error sending VoteRequest to {node_address}: {e}", exc_info=True)
             return None
-
-
-
-
-
-
-    async def _request_vote_from_node(self, node_stub: replication_pb2_grpc.NodeServiceStub, node_address: str) -> bool:
-        """Sends a VoteRequest to a node."""
-        try:
-            response = await asyncio.wait_for(
-                node_stub.RequestVote(
-                    replication_pb2.VoteRequest(
-                        candidate_id=self.id,
-                        candidate_address=self.address,
-                        term=self.current_term
-                    ),
-                    timeout=2
-                ),
-                timeout=2
-            )
-            return response.vote_granted
-        except (grpc.aio.AioRpcError, asyncio.TimeoutError) as e:
-            logging.warning(f"[{self.address}] Vote request to {node_address} failed: {e}")
-            return False
-        except Exception as e:
-            logging.error(f"[{self.address}] Unexpected error requesting vote from {node_address}: {e}", exc_info=True)
-            return False
-    async def _request_vote_from_node(self, node_stub: replication_pb2_grpc.NodeServiceStub, request: replication_pb2.VoteRequest, node_address: str) -> replication_pb2.VoteResponse:
-        """Sends a VoteRequest RPC to a specific node."""
-        try:
-             logging.debug(f"[{self.address}] Requesting vote from {node_address} for term {request.term}")
-             response = await node_stub.RequestVote(request, timeout=3)
-             # If a higher term is received in the vote response, immediately revert to follower
-             if response.HasField("voter_id") and response.voter_id != "unknown" and response.voter_id != self.id: # Check if response is valid and not from self
-                 # Note: The VoteResponse proto doesn't currently include the voter's term.
-                 # In a real Raft, you would check response.term > self.current_term here.
-                 # For this simplified model, we rely on AnnounceMaster for term updates.
-                 pass # No term check in vote response for now
-
-             return response
-        except grpc.aio.AioRpcError as e:
-             logging.warning(f"[{self.address}] RPC failed when requesting vote from {node_address} for term {request.term}: {e.code()} - {e.details()}")
-             return replication_pb2.VoteResponse(vote_granted=False, voter_id="unknown", voter_address=node_address)
-        except asyncio.TimeoutError:
-             logging.warning(f"[{self.address}] Vote request to {node_address} for term {request.term} timed out.")
-             return replication_pb2.VoteResponse(vote_granted=False, voter_id="unknown", voter_address=node_address)
-        except Exception as e:
-             logging.error(f"[{self.address}] Failed to request vote from {node_address} for term {request.term}: {type(e).__name__} - {e}", exc_info=True)
-             return replication_pb2.VoteResponse(vote_granted=False, voter_id="unknown", voter_address=node_address)
 
     async def _master_election_announcement_routine(self):
         """Periodically announces this node as the master."""
@@ -1546,109 +1913,24 @@ class Node:
             )
 
             announcement_tasks = []
-            for node_addr in self._node_stubs:
-                if node_addr != self.address:
-                    announcement_tasks.append(self._send_master_announcement(node_addr, announcement)) # Pass node_addr
+            for node_addr in list(self._node_stubs):
+                if node_addr == self.address:
+                    continue
+                try:
+                    await self._send_master_announcement(node_addr, announcement)
+                except (grpc.aio.AioRpcError, asyncio.TimeoutError) as e:
+                    logging.warning(f"[{self.address}] MasterAnnouncement to {node_addr} failed: {e}. Removing from cluster.")
+                    # prune it
+                    self._node_stubs.pop(node_addr, None)
+                    self._worker_stubs.pop(node_addr, None)
+                    self._channels.pop(node_addr, None)
+                  
 
             if announcement_tasks:
                 await asyncio.gather(*announcement_tasks, return_exceptions=True)
 
             await asyncio.sleep(5)  # Adjust interval as needed
         logging.info(f"[{self.address}] Master announcement routine stopped.")
-
-
-    async def inform_network_of_new_master(self, new_master_address: str):
-        """Informs all known nodes about the new master."""
-        logging.info(f"[{self.address}] Executing inform_network_of_new_master. New master is: {new_master_address}. I am {self.address}. My Term: {self.current_term}.")
-
-        if self.address == new_master_address:
-             logging.info(f"[{self.address}] I am the new master. Updating my status and informing network.")
-             self.role = 'master'
-             self.state = 'leader'
-             self.leader_address = self.address
-             self.current_master_address = self.address # Master's master is itself
-             # Term increment happens in start_election()
-
-             # Dynamically add MasterServiceServicer if not already added
-             if not self._master_service_added:
-                 logging.info(f"[{self.address}] Adding MasterServiceServicer to server dynamically.")
-                 replication_pb2_grpc.MasterServiceServicer.__init__(self)
-                 replication_pb2_grpc.add_MasterServiceServicer_to_server(self, self._server)
-                 self._master_service_added = True
-
-             # Dynamically add WorkerServiceServicer if not already added (important if a non-worker becomes master)
-             if not self._worker_service_added:
-                  logging.info(f"[{self.address}] Adding WorkerServiceServicer to server dynamically.")
-                  replication_pb2_grpc.WorkerServiceServicer.__init__(self)
-                  replication_pb2_grpc.add_WorkerServiceServicer_to_server(self, self._server)
-                  self._worker_service_added = True
-
-             # Stop master health check if it was running (only workers do this)
-             if self._master_health_check_task and not self._master_health_check_task.done():
-                  logging.info(f"[{self.address}] Cancelling master health check task as I became master.")
-                  self._master_health_check_task.cancel()
-                  # Remove from background tasks list
-                  if self._master_health_check_task in self._background_tasks:
-                      self._background_tasks.remove(self._master_health_check_task)
-                  self._master_health_check_task = None # Clear the reference
-
-
-        else:
-             logging.info(f"[{self.address}] Received information about new master {new_master_address}. Updating my state.")
-             # Only update if the announced master has a higher term (simplified, assuming term is implicit in announcement)
-             # or if we didn't know a master before, or if we were a candidate and now see a master.
-             # In a real Raft, you'd compare terms explicitly. For this model, just update if different or unknown.
-             if self.current_master_address != new_master_address or self.current_master_address is None or self.state == "candidate":
-                 logging.info(f"[{self.address}] Updating current master address to {new_master_address}")
-                 self.current_master_address = new_master_address
-                 self.leader_address = new_master_address
-                 self.state = 'follower'
-                 self.voted_for = None # Reset vote
-                 self.last_heartbeat_time = time.monotonic() # Reset heartbeat time on receiving announcement
-
-                 # If I am a worker, update my master stub and attempt to report unreported shards
-                 if self.role == 'worker':
-                    logging.info(f"[{self.address}] Updating MasterService stub to point to {new_master_address} and attempting to report unreported shards.")
-                    self._create_master_stubs(new_master_address)
-                    logging.info(f"[{self.address}] MasterService stub for {new_master_address} updated successfully.")
-                    asyncio.create_task(self._attempt_report_unreported_shards())
-
-                 # Ensure master health check is running if we are a worker
-                 if self.role == 'worker' and (self._master_health_check_task is None or self._master_health_check_task.done()):
-                      logging.info(f"[{self.address}] Starting master health check routine.")
-                      self._master_health_check_task = asyncio.create_task(self.check_master_health())
-                      self._background_tasks.append(self._master_health_check_task)
-
-
-        announcement_request = replication_pb2.MasterAnnouncement(
-            master_address=new_master_address,
-            node_id_of_master=self.id if self.address == new_master_address else "unknown_id", # Send own ID if I'm the master
-            term=self.current_term # Include current term in announcement
-        )
-
-        logging.info(f"[{self.address}] Announcing to known nodes: {self.known_nodes}")
-
-        # Send announcement to all other known nodes
-        announcement_tasks = []
-        for node_addr in self.known_nodes:
-             if node_addr != self.address:
-                node_stub = self._node_stubs.get(node_addr)
-                if node_stub:
-                    try:
-                        logging.info(f"[{self.address}] Announcing new master {new_master_address} (Term: {self.current_term}) to node {node_addr}")
-                        # Create a task for each announcement and store it
-                        task = asyncio.create_task(self._send_master_announcement(node_stub, announcement_request, node_addr))
-                        announcement_tasks.append(task)
-                        self._background_tasks.append(task) # Add to background tasks for cancellation
-
-                    except Exception as e:
-                        logging.error(f"[{self.address}] Failed to create task for master announcement to {node_addr}: {type(e).__name__} - {e}", exc_info=True)
-                else:
-                    logging.warning(f"[{self.address}] No NodeService stub for {node_addr}. Cannot send master announcement.")
-
-        # Optionally, wait for all announcement tasks to complete in this round
-        # await asyncio.gather(*announcement_tasks, return_exceptions=True)
-
 
     async def _send_master_announcement(self, node_address: str, announcement: replication_pb2.MasterAnnouncement):
         """Sends a MasterAnnouncement RPC to a node."""
@@ -1664,11 +1946,9 @@ class Node:
             logging.warning(f"[{self.address}] MasterAnnouncement to {node_address} failed: {e}")
         except Exception as e:
             logging.error(f"[{self.address}] Error sending MasterAnnouncement to {node_address}: {e}", exc_info=True)
-
             
     async def _start_election_with_delay(self):
         """Delays the election start by a randomized timeout."""
-
         if self._pre_election_delay_task and not self._pre_election_delay_task.done():
             self._pre_election_delay_task.cancel()  # Cancel any existing delay
         self.election_timeout = random.uniform(10, 15)
@@ -1677,41 +1957,123 @@ class Node:
         self._background_tasks.append(self._pre_election_delay_task)
 
     async def _election_delay_coro(self):
+        """Handles election delay with deadlock prevention"""
         try:
             await asyncio.sleep(self.election_timeout)
-            await self._start_election()  # Now start the election
+            
+            # Check if another node started election while we were waiting
+            if self.state != "follower" or self.current_master_address:
+                logging.info(f"[{self.address}] Aborting election - cluster state changed during delay")
+                return
+                
+            # Force election resolution after too many attempts
+            if hasattr(self, 'election_attempts') and self.election_attempts > 3:
+                logging.warning(f"[{self.address}] Detected potential election deadlock after {self.election_attempts} attempts")
+                
+                # Force resolution based on node address - deterministic across cluster
+                for node_addr in sorted(self.known_nodes + [self.address]):
+                    if node_addr == self.address:
+                        # We're the lowest node ID that's still alive - become leader
+                        logging.info(f"[{self.address}] Forcing election resolution - becoming master by ID priority")
+                        await self._become_master()
+                        return
+                    
+                    # Check if this node with better ID is alive
+                    if self._validate_stub(node_addr):
+                        logging.info(f"[{self.address}] Detected alive node {node_addr} with better ID priority")
+                        break
+            
+            # Normal election start
+            await self.start_election()
         except asyncio.CancelledError:
             logging.info(f"[{self.address}] Pre-election delay cancelled.")
 
+
+    async def retry_register_with_master(self, interval: float = 5.0):
+        """Periodically attempts to register with master if not yet successful."""
+        while self.role == 'worker':
+            try:
+                # Ensure the master stub exists or recreate it if needed
+                if not self.master_stub:
+                    self._create_master_stubs(self.current_master_address)
+                       # Build and send the registration request to the master
+                req = replication_pb2.RegisterWorkerRequest(worker_address=self.address)
+                resp = await self.master_stub.RegisterWorker(req)
+                if resp.success:
+                    logging.info(f"[{self.address}] Successfully registered with master on retry: {resp.message}")
+                    return  # Stop retrying after success
+                else:
+                    logging.info(f"[{self.address}] Retry registration response: {resp.message}")
+            except Exception as e:
+                logging.warning(f"[{self.address}] Retry register failed: {e}")
+            await asyncio.sleep(interval)
+
     async def check_master_health(self):
         """Periodically checks the health of the master node."""
-        while self.role == 'worker' and self.current_master_address:
+        while self.role == 'worker': 
+            if not self.current_master_address:
+                logging.info(f"[{self.address}] No master known, waiting briefly before checking again")
+                await asyncio.sleep(2)
+                continue
             try:
                 # Get a NodeServiceStub for the master
                 master_node_channel = self._get_or_create_channel(self.current_master_address)
                 if not master_node_channel:
                     logging.warning(f"[{self.address}] Could not get channel to master at {self.current_master_address} for health check.")
-                    await self._start_election_with_delay()  # Or some election trigger
-                    return
+                    self.current_master_address = None  # Clear the master address
+                    await self._start_election_with_delay()  # Start election
+                    continue  # Continue the loop instead of returning
+                    
                 master_node_stub = replication_pb2_grpc.NodeServiceStub(master_node_channel)
 
-                await asyncio.wait_for(
+                response = await asyncio.wait_for(
                     master_node_stub.GetNodeStats(replication_pb2.NodeStatsRequest()),
-                    timeout=5  # Adjust timeout as needed
+                    timeout=5
                 )
+                
+                # Update our knowledge of the network based on master's stats
+                if response.known_nodes_count > len(self.known_nodes) + 1:  # +1 for self
+                    logging.info(f"[{self.address}] Master knows more nodes than we do. Requesting update.")
+                    await self._request_node_list_update(master_node_stub)
+                    
                 logging.debug(f"[{self.address}] Master at {self.current_master_address} is healthy.")
                 self.last_heartbeat_time = time.monotonic()  # Update heartbeat
             except (grpc.aio.AioRpcError, asyncio.TimeoutError) as e:
-                logging.error(f"[{self.address}] Master at {self.current_master_address} is unreachable (health check failed): {e}")
+                logging.error(f"[{self.address}] Master unreachable: {e}")
                 time_since_last_heartbeat = time.monotonic() - self.last_heartbeat_time
+                
                 if time_since_last_heartbeat > self.election_timeout:
-                    logging.info(f"[{self.address}] Master heartbeat timeout exceeded. Starting election.")
-                    await self._start_election_with_delay() # Use the delayed start
-                    break # Exit the loop
+                    # Remove failed master from all tracking
+                    failed_master = self.current_master_address
+                    if failed_master in self.known_nodes:
+                        self.known_nodes.remove(failed_master)
+                    if failed_master in self._node_stubs:
+                        del self._node_stubs[failed_master]
+                    if failed_master in self._channels:
+                        await self._channels[failed_master].close()
+                        del self._channels[failed_master]
+                    
+                    self.current_master_address = None
+                    logging.info(f"[{self.address}] Init election after master {failed_master} removal")
+                    await self._start_election_with_delay()
+                    # break
             except Exception as e:
                 logging.error(f"[{self.address}] Error checking master health: {e}", exc_info=True)
-            await asyncio.sleep(2)  # Adjust sleep interval
+            await asyncio.sleep(2)  # Adjust as needed
         logging.info(f"[{self.address}] Master health check routine stopped.")
+
+    async def _request_node_list_update(self, master_node_stub):
+        """Request an updated node list from the master."""
+        try:
+            response = await master_node_stub.GetAllNodes(replication_pb2.GetAllNodesRequest())
+            for node_info in response.nodes:
+                node_addr = f"{node_info.address}:{node_info.port}"
+                if node_addr != self.address and node_addr not in self.known_nodes:
+                    logging.info(f"[{self.address}] Adding newly discovered node {node_addr} to known_nodes")
+                    self.known_nodes.append(node_addr)
+                    self._create_stubs_for_node(node_addr)
+        except Exception as e:
+            logging.error(f"[{self.address}] Failed to get node list from master: {e}")
 
 
 async def serve(host: str, port: int, role: str, master_address: Optional[str], known_nodes: List[str]):
@@ -1771,5 +2133,3 @@ if __name__ == '__main__':
                   loop.close()
 
         logging.info(f"[{args.host}:{args.port}] Node process finished.")
-
-

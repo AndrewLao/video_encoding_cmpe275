@@ -4,6 +4,8 @@ package replication;
 
 // Service for client-master interactions and master-side operations
 service MasterService {
+  // New RPC: workers call this to join the cluster dynamically
+  rpc RegisterWorker (RegisterWorkerRequest) returns (RegisterWorkerResponse);
   // Client streams UploadVideoChunk messages, server responds with one UploadVideoResponse
   rpc UploadVideo (stream UploadVideoChunk) returns (UploadVideoResponse);
   // Server streams RetrieveVideoChunk messages, client receives the stream
@@ -27,6 +29,17 @@ service VideoProcessingService {
   rpc GetVideoMetadata (GetVideoMetadataRequest) returns (GetVideoMetadataResponse);
 }
 
+// Request for a worker to register itself with the master
+message RegisterWorkerRequest {
+  string worker_address = 1;  // "host:port" of the worker
+}
+
+// Response from the master acknowledging registration
+message RegisterWorkerResponse {
+  bool   success = 1;
+  string message = 2;
+}
+
 // Service for master-worker interactions (processing video shards)
 service WorkerService {
   // Master sends shard to worker for processing (e.g., resizing)
@@ -42,6 +55,11 @@ service NodeService {
   rpc GetNodeStats (NodeStatsRequest) returns (NodeStatsResponse);
   // New RPC for clients or other nodes to discover the current master
   rpc GetCurrentMaster (GetCurrentMasterRequest) returns (GetCurrentMasterResponse);
+  // New RPCs for node registration and topology management
+  rpc ReportResourceScore(ReportResourceScoreRequest) returns (ReportResourceScoreResponse);
+  rpc RegisterNode (RegisterNodeRequest) returns (RegisterNodeResponse);
+  rpc UpdateNodeList (UpdateNodeListRequest) returns (UpdateNodeListResponse);
+  rpc GetAllNodes (GetAllNodesRequest) returns (GetAllNodesResponse);
 }
 
 // --- Message Definitions ---
@@ -61,7 +79,6 @@ message UploadVideoChunk {
   string   original_filename  = 9;
 }
 
-
 message UploadVideoResponse {
   string video_id = 1; // The definitive ID assigned by the master
   bool success = 2;
@@ -78,7 +95,6 @@ message RetrieveVideoChunk {
   bytes data_chunk = 2; // A chunk of the processed video data
   // Could add sequence number or is_last_chunk if needed, but gRPC stream handles end
 }
-
 
 // For MasterService.GetVideoStatus
 message VideoStatusRequest {
@@ -103,7 +119,6 @@ message ReportWorkerShardStatusResponse {
     bool success = 1;
     string message = 2;
 }
-
 
 // For WorkerService.ProcessShard (Master sends this to Worker)
 // Note: This request is also named DistributeShardRequest in the node.py logic
@@ -149,17 +164,103 @@ message MasterAnnouncementResponse {
   string node_id = 2; // The ID of the responding node
 }
 
-// For NodeService.RequestVote
+// New message definitions from mini3
 message VoteRequest {
-  string candidate_id = 1;     // Unique ID of the node requesting votes
-  string candidate_address = 2; // Network address of the candidate
-  int32 term = 3; // The candidate's term
+  int32 term = 1;
+  string candidate_id = 2;
+  float score = 3;
 }
 
 message VoteResponse {
-  bool vote_granted = 1;
-  string voter_id = 2;          // Unique ID of the node casting this vote
-  string voter_address = 3;     // Network address of the voter
+  int32 term = 1;
+  bool vote_granted = 2;
+  string voter_id = 3;
+}
+
+message ResourceScoreRequest {
+  string original_requester = 1;
+  repeated string visited_nodes = 2;
+}
+
+message ResourceScoreResponse {
+  string server_id = 1;
+  float score = 2;
+  float load_avg = 3;
+  float io_wait = 4;
+  float net_usage_mb = 5;
+  float memory_stored_mb = 6;
+  repeated ResourceScore collected_scores = 7;
+}
+
+message ResourceScore {
+  string server_id = 1;
+  float score = 2;
+  float load_avg = 3;
+  float io_wait = 4;
+  float net_usage_mb = 5;
+  float memory_stored_mb = 6;
+}
+
+message ReportResourceScoreRequest {
+  string worker_address = 1;
+  ResourceScore resource_score = 2;
+}
+
+message ReportResourceScoreResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message LeaderRequest {
+  // Empty request
+}
+
+message ServerEndpoint {
+  string server_id = 1;
+  string address = 2;
+  int32 port = 3;
+}
+
+message LeaderResponse {
+  bool is_leader = 1;
+  string leader_address = 2;
+  int32 leader_port = 3;
+  repeated ServerEndpoint server_endpoints = 4;
+}
+
+message RegisterNodeRequest {
+  string node_id = 1;
+  string address = 2;
+  int32 port = 3;
+}
+
+message RegisterNodeResponse {
+  bool success = 1;
+  string current_leader = 2;
+  repeated string nodes = 3;
+}
+
+message TopologyUpdateRequest {
+  string update_type = 1;  // "add" or "remove"
+  string node_id = 2;
+  string address = 3;
+  int32 port = 4;
+}
+
+message TopologyUpdateResponse {
+  bool success = 1;
+}
+
+message NodeInfo {
+  string node_id = 1;
+  string address = 2;
+  int32 port = 3;
+}
+
+message GetAllNodesRequest {}
+
+message GetAllNodesResponse {
+  repeated NodeInfo nodes = 1;
 }
 
 // For NodeService.GetNodeStats
@@ -294,4 +395,15 @@ message GetShardResponse {
   bool success = 1;
   bytes shard_data = 2; // The binary content of the shard file
   string message = 3; // Status or error message
+}
+
+// For NodeService.UpdateNodeList
+message UpdateNodeListRequest {
+  repeated string node_addresses = 1;  // List of all known nodes
+  string master_address = 2;           // Current master address
+}
+
+message UpdateNodeListResponse {
+  bool success = 1;
+  string message = 2;
 }

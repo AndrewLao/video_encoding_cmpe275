@@ -18,7 +18,7 @@ VENV_DIR="venv"
 if [ ! -d "$VENV_DIR" ]; then
   echo "Creating virtual environment in ./$VENV_DIR"
   # Create a new virtual environment using python3
-  python3 -m venv "$VENV_DIR"
+  python3.12 -m venv "$VENV_DIR"
 else
   echo "Virtual environment already exists in ./$VENV_DIR"
 fi
@@ -57,7 +57,7 @@ fi
 # --pyi_out=. generates Python interface files (.pyi) for type hinting (optional but good).
 # --grpc_python_out=. generates the gRPC service client and server classes.
 echo "Running protoc compiler on $PROTO_FILE..."
-python -m grpc_tools.protoc -I. --python_out=. --pyi_out=. --grpc_python_out=. "$PROTO_FILE"
+python3.12 -m grpc_tools.protoc -I. --python_out=. --pyi_out=. --grpc_python_out=. "$PROTO_FILE"
 
 # Check the exit status of the protoc command
 if [ $? -eq 0 ]; then

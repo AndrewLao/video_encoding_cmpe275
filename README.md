@@ -186,7 +186,3 @@ Metrics include:
 - **Parallelism**: 3 workers recommended per 4-core CPU
 - **Network**: 1Gbps+ recommended for HD content
 - **Storage**: Separate disks for shards and final output
-
-## License
-
-Apache 2.0 - See [LICENSE](LICENSE) for details

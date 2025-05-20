@@ -152,20 +152,33 @@ Metrics include:
 ## Fault Tolerance Scenarios
 
 1. **Master Failure**
+   
       - Workers detect master timeout
+   
       - Leader election initiated
+   
       - New master restores from backups
+   
       - Processing resumes automatically
+   
 
-2. **Worker Failure**
+3. **Worker Failure**
+   
       - Master redistributes failed shards
+   
       - Failed worker removed from pool
+   
       - New workers automatically registered
+   
 
-3. **Network Partitions**
+5. **Network Partitions**
+   
       - Majority quorum maintained
+   
       - Split-brain prevention via term validation
+   
       - Automatic reconciliation post-recovery
+   
 
 ## Performance Considerations
 

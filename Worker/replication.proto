@@ -60,9 +60,6 @@ service NodeService {
   rpc RegisterNode (RegisterNodeRequest) returns (RegisterNodeResponse);
   rpc UpdateNodeList (UpdateNodeListRequest) returns (UpdateNodeListResponse);
   rpc GetAllNodes (GetAllNodesRequest) returns (GetAllNodesResponse);
-  rpc ReplicateVideo(ReplicateVideoRequest) returns (ReplicateVideoResponse);
-  // New method for backup data
-  rpc RequestBackupData(RequestBackupDataRequest) returns (RequestBackupDataResponse);
 }
 
 // --- Message Definitions ---
@@ -420,24 +417,4 @@ message ReplicateVideoRequest {
 message ReplicateVideoResponse {
     bool success = 1;
     string message = 2;
-}
-
-// Define a message for backup file data
-message BackupFile {
-  string video_id = 1;
-  bytes file_data = 2;
-  string container = 3;
-  string filename = 4;
-}
-
-// Request to get backup data from backup servers
-message RequestBackupDataRequest {
-  string new_master_address = 1;
-}
-
-// Response with backup data
-message RequestBackupDataResponse {
-  bool success = 1;
-  string message = 2;
-  repeated BackupFile backup_files = 3;
 }

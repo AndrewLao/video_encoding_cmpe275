@@ -94,7 +94,7 @@ This script provides the command-line interface for interacting with the distrib
 
 ### Helper Scripts
 
-The repository includes several bash scripts to simplify setup, execution, and testing.
+The repository includes several  scripts to simplify setup, execution, and testing.
 
 - **`setup_env.sh`**:
   - Creates a Python virtual environment (`venv`).
@@ -133,7 +133,7 @@ The repository includes several bash scripts to simplify setup, execution, and t
 2.  **Run the setup script:**
 
     ```
-    bash setup_env.sh
+     setup_env.sh
 
     ```
 
@@ -149,7 +149,7 @@ The repository includes several bash scripts to simplify setup, execution, and t
 4.  **Create test videos (optional but recommended):**
 
     ```
-    bash create_test_video.sh
+     create_test_video.sh
 
     ```
 
@@ -158,14 +158,14 @@ The repository includes several bash scripts to simplify setup, execution, and t
 1.  **Start the master node:**
 
     ```
-    bash start_master.sh
+     start_master.sh
 
     ```
 
 2.  **Start the worker nodes (in separate terminals):**
 
     ```
-    bash start_worker.sh # This script typically starts multiple workers
+     start_worker.sh # This script typically starts multiple workers
     # Or start individual workers:
     # python node.py --role worker --host <worker_ip> --port <worker_port> --master <master_ip:master_port> --nodes <master_ip:master_port>,<other_worker1_ip:port>,...
 
@@ -191,7 +191,7 @@ The repository includes several bash scripts to simplify setup, execution, and t
 4.  **To stop the system:**
 
     ```
-    bash killscript.sh
+     killscript.sh
 
     ```
 

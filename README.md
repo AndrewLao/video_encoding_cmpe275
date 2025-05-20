@@ -44,7 +44,7 @@ This is a production-grade distributed video processing system with fault tolera
 
 1. **Set Up Environment**
 
-'''bash
+```
 
 # Install system dependencies
 
@@ -58,37 +58,37 @@ source venv/bin/activate
 # Install Python dependencies
 
 pip install grpcio protobuf grpcio-tools tqdm psutil ffmpeg-python
-'''
+```
 
 2. **Generate Protobuf Files**
 
-```bash
+```
 python -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. replication.proto
 ```
 
 3. **Create Test Video**
 
-```bash
-bash create_test_video.sh  # Generates sample videos
+```
+ create_test_video.sh  # Generates sample videos
 ```
 
 ## Running the System
 
 ### Start Master Node
 
-```bash
-bash start_master.sh  # Default: localhost:50051
+```
+ start_master.sh  # Default: localhost:50051
 ```
 
 ### Start Worker Nodes
 
-```bash
-bash start_worker.sh  # Starts 3 workers on ports 50061-50063
+```
+ start_worker.sh  # Starts 3 workers on ports 50061-50063
 ```
 
 ### Start Backup Node
 
-```bash
+```
 python node.py --role worker --host localhost --port 50061 --backup-servers localhost:50061
 ```
 
@@ -96,7 +96,7 @@ python node.py --role worker --host localhost --port 50061 --backup-servers loca
 
 ### Upload and Process Video
 
-```bash
+```
 python client.py --master localhost:50051
   --upload ./test_video.mp4
   --width 640 --height 480
@@ -107,7 +107,7 @@ python client.py --master localhost:50051
 
 ### Retrieve Processed Video
 
-```bash
+```
 python client.py --master localhost:50051
   --retrieve <video_id>
   --output ./downloaded.mkv
@@ -115,7 +115,7 @@ python client.py --master localhost:50051
 
 ### Check Processing Status
 
-```bash
+```
 python client.py --master localhost:50051 --status <video_id>
 ```
 
@@ -140,13 +140,6 @@ python client.py --master localhost:50051 --status <video_id>
 | `killscript.sh`        | Graceful system shutdown and cleanup         |
 
 ## Monitoring and Metrics
-
-Access real-time node statistics:
-
-```python
-# Example using grpcurl
-grpcurl -plaintext localhost:50051 replication.NodeService/GetNodeStats
-```
 
 Metrics include:
 
@@ -188,5 +181,6 @@ Apache 2.0 - See [LICENSE](LICENSE) for details
 
 ---
 
-[!NOTE]
+# Note
+
 For production deployments, modify the `start_*.sh` scripts to use actual IP addresses and configure firewall rules appropriately.

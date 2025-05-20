@@ -83,13 +83,12 @@ python -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. replication.p
 ### Start Worker Nodes
 
 ```
- start_worker.sh  # Starts 3 workers on ports 50061-50063
-```
+ # Remove the backup-servers flag to run without backups, run each on a separated terminal or system
+python node.py --role worker --host localhost --port 50061 --master localhost:50051 --backup-servers localhost:50061
 
-### Start Backup Node
+python node.py --role worker --host localhost --port 50062 --master localhost:50051 --backup-servers localhost:50061
 
-```
-python node.py --role worker --host localhost --port 50061 --backup-servers localhost:50061
+python node.py --role worker --host localhost --port 50063 --master localhost:50051 --backup-servers localhost:500614
 ```
 
 ## Client Operations

@@ -1,6 +1,6 @@
 # Distributed Video Encoding System
 
-This is a production-grade distributed video processing system with fault tolerance, leader election, and automatic scaling capabilities.
+This is a distributed video processing system with fault tolerance, leader election, and automatic scaling capabilities.
 
 ## Key Features
 
@@ -10,8 +10,7 @@ This is a production-grade distributed video processing system with fault tolera
     - Data replication to backup nodes
     - Automatic restoration from backups
 
-- **Advanced Video Processing**
-    - Dynamic resolution scaling (upscale/downscale)
+- **Video Processing**
     - Multi-format support (MP4, MKV, WebM, MOV)
     - Keyframe-aware video segmentation
     - Parallel shard processing with FFmpeg
@@ -49,6 +48,7 @@ This is a production-grade distributed video processing system with fault tolera
 # Install system dependencies
 
 sudo apt-get install -y ffmpeg mkvtoolnix libx264-dev
+This installs the FFmpeg library. This step is different depending on the device. For Mac devices a simple `brew install ffmpeg` should suffice but for Windows, you need to install the binary from the FFmpeg site.
 
 # Create and activate virtual environment
 
@@ -190,9 +190,3 @@ Metrics include:
 ## License
 
 Apache 2.0 - See [LICENSE](LICENSE) for details
-
----
-
-# Note
-
-For production deployments, modify the `start_*.sh` scripts to use actual IP addresses and configure firewall rules appropriately.
